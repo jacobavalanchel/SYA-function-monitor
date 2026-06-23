@@ -8,6 +8,8 @@ venv/
 .env
 .env.*
 !.env.example
+config.json
+config.local.json
 
 # Logs and local output
 *.log

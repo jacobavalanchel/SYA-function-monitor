@@ -1,0 +1,7 @@
+{
+  "api": {
+    "path": "https://aigc-api.hkust-gz.edu.cn/v1/chat/completions",
+    "key": "",
+    "model": "gpt-4-turbo"
+  }
+}

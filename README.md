@@ -55,12 +55,38 @@ ssh -L 8765:localhost:8765 <host>
 The demo can call the HKUST-GZ AIGC API or another OpenAI-compatible endpoint.
 
 - Default endpoint: `https://aigc-api.hkust-gz.edu.cn/v1/chat/completions`
-- Default model in the page: `gpt-4-turbo`
-- Auth: bearer token supplied in the page at runtime
+- Default model: `gpt-4-turbo`
+- Auth: bearer token loaded by `server.py` from local config
 
-Do not commit API keys. The API key input is intentionally blank by default.
+Create local API config before enabling screen reading:
+
+```bash
+cd function/monitor
+cp config.example.json config.local.json
+```
+
+Then edit `config.local.json`:
+
+```json
+{
+  "api": {
+    "path": "https://aigc-api.hkust-gz.edu.cn/v1/chat/completions",
+    "key": "YOUR_API_KEY",
+    "model": "gpt-4-turbo"
+  }
+}
+```
+
+`config.local.json` and `config.json` are ignored by Git. Do not commit API
+keys. To use a custom config location, set `MONITOR_CONFIG_PATH` before running
+the server:
+
+```bash
+MONITOR_CONFIG_PATH=/secure/path/monitor-api.json python3 server.py
+```
+
 Requests are proxied through `server.py` at `/api/llm` to avoid browser CORS
-restrictions.
+restrictions. The browser never receives the API key.
 
 ### Files
 
@@ -68,6 +94,7 @@ restrictions.
 | --- | --- |
 | `index.html` | Self-contained frontend app |
 | `server.py` | Static file server and LLM API proxy |
+| `config.example.json` | Example API config schema |
 | `test_vision_support.py` | Script to test which models support vision |
 | `HANDOVER.md` | Original demo handover notes |
 | `module.json` | Parent module metadata |

@@ -221,12 +221,7 @@ button:disabled { background: #222; color: #555; cursor: default; }
 
     <div class="card" id="api-card">
       <h3>LLM API Settings</h3>
-      <label class="api-label">API URL
-        <input type="text" id="api-url" class="api-input" value="https://aigc-api.hkust-gz.edu.cn/v1/chat/completions">
-      </label>
-      <label class="api-label">API Key
-        <input type="password" id="api-key" class="api-input" value="" placeholder="Paste API key at runtime">
-      </label>
+      <div id="api-config-status" class="llm-status">Checking server config...</div>
       <label class="api-label">Crop Size (px)
         <input type="number" id="crop-size" class="api-input" value="400" min="100" max="1200" step="50">
       </label>
@@ -598,12 +593,38 @@ const dwellIndicator = document.getElementById("dwell-indicator");
 const llmCard = document.getElementById("llm-card");
 const llmStatus = document.getElementById("llm-status");
 const llmOutput = document.getElementById("llm-output");
-const apiUrlInput = document.getElementById("api-url");
-const apiKeyInput = document.getElementById("api-key");
+const apiConfigStatus = document.getElementById("api-config-status");
 const cropSizeInput = document.getElementById("crop-size");
 
 const offCanvas = document.createElement("canvas");
 const offCtx = offCanvas.getContext("2d");
+const DEFAULT_MODEL = "gpt-4-turbo";
+let apiConfig = {
+  configured: false,
+  apiPath: "",
+  model: DEFAULT_MODEL,
+  configFile: "",
+};
+
+async function loadApiConfig() {
+  try {
+    const resp = await fetch("/api/config");
+    if (!resp.ok) throw new Error(`Config ${resp.status}`);
+    apiConfig = await resp.json();
+    if (apiConfig.configured) {
+      apiConfigStatus.textContent = `Server config loaded: ${apiConfig.model || DEFAULT_MODEL}`;
+      apiConfigStatus.className = "llm-status done";
+    } else {
+      apiConfigStatus.textContent = "Missing config.local.json api.path/api.key";
+      apiConfigStatus.className = "llm-status error";
+    }
+  } catch (err) {
+    apiConfigStatus.textContent = "Start server.py to load API config";
+    apiConfigStatus.className = "llm-status error";
+  }
+}
+
+await loadApiConfig();
 
 document.addEventListener("mousemove", (e) => {
   mouseX = e.clientX;
@@ -688,11 +709,8 @@ function stopScreenReading() {
 // MORE_LLM_CALL_JS
 
 async function triggerLLMCall(sx, sy, size) {
-  const apiUrl = apiUrlInput.value.trim();
-  const apiKey = apiKeyInput.value.trim();
-
-  if (!apiUrl || !apiKey) {
-    llmStatus.textContent = "No API key/URL configured";
+  if (!apiConfig.configured) {
+    llmStatus.textContent = "No server API config";
     llmStatus.className = "llm-status error";
     return;
   }
@@ -723,7 +741,7 @@ async function triggerLLMCall(sx, sy, size) {
     const cropBase64 = cropDataUrl.split(",")[1];
 
     const payload = {
-      model: "gpt-4-turbo",
+      model: apiConfig.model || DEFAULT_MODEL,
       max_tokens: 1024,
       messages: [{
         role: "user",
@@ -743,10 +761,6 @@ async function triggerLLMCall(sx, sy, size) {
         ],
       }],
     };
-
-    // Route through local proxy to avoid CORS
-    payload._api_url = apiUrl;
-    payload._api_key = apiKey;
 
     const resp = await fetch("/api/llm", {
       method: "POST",
