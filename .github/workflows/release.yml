@@ -6,11 +6,11 @@ on:
       tag:
         description: "Release tag, for example v0.1.0"
         required: true
-        default: "v0.1.0"
+        default: "v0.1.1"
       version:
         description: "Artifact version, for example 0.1.0"
         required: true
-        default: "0.1.0"
+        default: "0.1.1"
   push:
     tags:
       - "v*"

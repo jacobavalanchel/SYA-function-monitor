@@ -1,6 +1,6 @@
 {
   "id": "monitor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "runtime": "local-http",
   "entry": {
     "command": "bin/monitor-server",

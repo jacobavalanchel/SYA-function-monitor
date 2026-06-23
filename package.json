@@ -1,6 +1,6 @@
 {
   "name": "@sya/function-monitor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Private local monitoring function module for SYA.",
   "type": "commonjs",
@@ -29,6 +29,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "devDependencies": {
-    "@types/node": "^24.10.1"
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
   }
 }
