@@ -15,4 +15,5 @@ config.local.json
 *.log
 logs/
 dist/
+release/
 build/

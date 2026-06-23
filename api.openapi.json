@@ -1,0 +1,308 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "SYA Monitor Function API",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Monitor function health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/manifest": {
+      "get": {
+        "operationId": "manifest",
+        "responses": {
+          "200": {
+            "description": "Monitor function manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/screen/status": {
+      "get": {
+        "operationId": "screen.status",
+        "responses": {
+          "200": {
+            "description": "Current screen monitor status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/screen/start": {
+      "post": {
+        "operationId": "screen.start",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "rateMs": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Started screen monitoring",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/screen/stop": {
+      "post": {
+        "operationId": "screen.stop",
+        "responses": {
+          "200": {
+            "description": "Stopped screen monitoring",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/camera/status": {
+      "get": {
+        "operationId": "camera.status",
+        "responses": {
+          "200": {
+            "description": "Current camera monitor status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/camera/start": {
+      "post": {
+        "operationId": "camera.start",
+        "responses": {
+          "200": {
+            "description": "Started camera monitoring",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/camera/stop": {
+      "post": {
+        "operationId": "camera.stop",
+        "responses": {
+          "200": {
+            "description": "Stopped camera monitoring",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/storage/stats": {
+      "get": {
+        "operationId": "storage.stats",
+        "responses": {
+          "200": {
+            "description": "Monitor storage statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/storage/screen-records": {
+      "get": {
+        "operationId": "storage.screenRecords",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored screen records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/storage/camera-records": {
+      "get": {
+        "operationId": "storage.cameraRecords",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored camera records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/attention/config/status": {
+      "get": {
+        "operationId": "attention.config.status",
+        "responses": {
+          "200": {
+            "description": "Attention LLM configuration status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/events": {
+      "get": {
+        "operationId": "events",
+        "responses": {
+          "200": {
+            "description": "Monitor server-sent events stream",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "FunctionResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["ok", "data"],
+            "properties": {
+              "ok": {
+                "const": true
+              },
+              "data": {}
+            }
+          },
+          {
+            "type": "object",
+            "required": ["ok", "error"],
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "error": {
+                "type": "object",
+                "required": ["code", "message"],
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "details": {}
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

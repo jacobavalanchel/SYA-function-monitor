@@ -1,0 +1,21 @@
+{
+  "id": "monitor",
+  "version": "0.1.0",
+  "runtime": "local-http",
+  "entry": {
+    "command": "bin/monitor-server",
+    "args": []
+  },
+  "api": {
+    "basePath": "/api/monitor",
+    "health": {
+      "method": "GET",
+      "path": "/health"
+    },
+    "events": {
+      "transport": "sse",
+      "path": "/events"
+    }
+  },
+  "permissions": ["screen", "camera", "storage"]
+}
