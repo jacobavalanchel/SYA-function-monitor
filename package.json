@@ -1,0 +1,8 @@
+{
+  "name": "@sya/function-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private local monitoring function module for SYA.",
+  "type": "module",
+  "license": "UNLICENSED"
+}
