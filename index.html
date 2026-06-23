@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Attention-Aware Video Player</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #0f0f13;
+  color: #e0e0e0;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-height: 100vh;
+  padding: 20px 16px;
+  gap: 16px;
+}
+h1 { font-size: 1.1rem; font-weight: 500; color: #666; letter-spacing: 0.1em; text-transform: uppercase; }
+
+/* ── Status banner ── */
+#status-banner {
+  width: 100%; max-width: 960px;
+  padding: 16px 24px;
+  border-radius: 10px;
+  text-align: center;
+  font-size: 1.8rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  transition: background 0.3s, color 0.3s, border-color 0.3s;
+  border: 1.5px solid #333;
+  background: #1a1a22; color: #666;
+}
+#status-banner.attentive  { background: #0d2e1a; color: #3ddc84; border-color: #3ddc84; }
+#status-banner.distracted { background: #2e0d0d; color: #ff5252; border-color: #ff5252; }
+
+/* ── Main layout ── */
+#main-row {
+  display: flex; gap: 16px;
+  width: 100%; max-width: 960px;
+  align-items: flex-start; flex-wrap: wrap; justify-content: center;
+}
+
+/* ── Webcam column ── */
+#cam-col { display: flex; flex-direction: column; gap: 10px; }
+#video-wrap { position: relative; }
+#webcam {
+  display: block; width: 320px; height: 240px;
+  border-radius: 8px; background: #111; object-fit: cover;
+}
+#overlay {
+  position: absolute; top: 0; left: 0;
+  width: 320px; height: 240px;
+  border-radius: 8px; pointer-events: none;
+}
+
+/* ── Info cards ── */
+.card {
+  background: #1a1a22; border-radius: 8px;
+  padding: 12px 14px; border: 1px solid #2a2a38;
+  width: 320px;
+}
+.card h3 { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em; color: #555; margin-bottom: 10px; }
+.dir-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.dir-item { display: flex; flex-direction: column; gap: 2px; }
+.dir-label { font-size: 0.65rem; color: #555; text-transform: uppercase; letter-spacing: 0.08em; }
+.dir-value { font-size: 0.95rem; font-weight: 600; color: #aaa; transition: color 0.2s; }
+.dir-value.off-center { color: #f0a500; }
+.ratio-row { display: flex; justify-content: space-between; font-size: 0.75rem; color: #555; padding: 2px 0; }
+.ratio-row span:last-child { color: #888; font-variant-numeric: tabular-nums; }
+#log-list { list-style: none; display: flex; flex-direction: column; gap: 3px; max-height: 120px; overflow-y: auto; }
+#log-list li { font-size: 0.75rem; padding: 3px 6px; border-radius: 4px; background: #111; color: #555; }
+#log-list li.play  { color: #3ddc84; }
+#log-list li.pause { color: #ff5252; }
+
+/* ── Player column ── */
+#player-col { flex: 1; min-width: 300px; display: flex; flex-direction: column; gap: 10px; }
+
+#player-wrap {
+  background: #111; border-radius: 10px; overflow: hidden;
+  border: 1px solid #2a2a38; position: relative;
+  min-height: 200px; display: flex; align-items: center; justify-content: center;
+}
+#player-wrap video, #player-wrap #screen-video {
+  width: 100%; max-height: 420px; display: block; background: #000;
+}
+#player-placeholder {
+  color: #444; font-size: 0.9rem; text-align: center; padding: 40px 20px; line-height: 1.8;
+}
+
+#controls-row { display: flex; gap: 8px; flex-wrap: wrap; }
+button {
+  padding: 9px 18px; border-radius: 7px; border: none;
+  font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: background 0.2s;
+}
+button:disabled { background: #222; color: #555; cursor: default; }
+#btn-cam    { background: #3a3aff; color: #fff; }
+#btn-cam:hover:not(:disabled) { background: #5555ff; }
+#btn-file   { background: #2a2a38; color: #aaa; }
+#btn-file:hover:not(:disabled) { background: #3a3a50; }
+#btn-screen { background: #2a2a38; color: #aaa; }
+#btn-screen:hover:not(:disabled) { background: #3a3a50; }
+#btn-stop-screen { background: #3a1a1a; color: #ff5252; display: none; }
+#btn-stop-screen:hover { background: #5a2a2a; }
+#file-input { display: none; }
+
+#loader-txt { font-size: 0.8rem; color: #555; }
+
+/* ── Attention override note ── */
+#override-note {
+  font-size: 0.72rem; color: #555; text-align: center;
+  padding: 6px; background: #1a1a22; border-radius: 6px;
+}
+
+/* ── Crop preview ── */
+#crop-canvas {
+  width: 320px; height: 320px;
+  border-radius: 6px; background: #111;
+  display: block;
+}
+.dwell-bar {
+  height: 4px; border-radius: 2px;
+  background: #333; margin-top: 6px;
+  position: relative; overflow: hidden;
+}
+.dwell-bar::after {
+  content: '';
+  position: absolute; left: 0; top: 0; height: 100%;
+  width: var(--dwell-progress, 0%);
+  background: #3ddc84;
+  transition: width 0.1s linear;
+  border-radius: 2px;
+}
+
+/* ── LLM output ── */
+.llm-status {
+  font-size: 0.7rem; color: #555;
+  margin-bottom: 6px; text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.llm-status.loading { color: #f0a500; }
+.llm-status.done    { color: #3ddc84; }
+.llm-status.error   { color: #ff5252; }
+.llm-output {
+  font-size: 0.8rem; color: #bbb;
+  max-height: 200px; overflow-y: auto;
+  line-height: 1.5; white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── API settings ── */
+.api-label {
+  display: block; font-size: 0.68rem;
+  color: #555; text-transform: uppercase;
+  letter-spacing: 0.08em; margin-bottom: 8px;
+}
+.api-input {
+  display: block; width: 100%; margin-top: 4px;
+  padding: 6px 8px; border-radius: 5px;
+  border: 1px solid #2a2a38; background: #111;
+  color: #ccc; font-size: 0.8rem;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
+.api-input:focus { border-color: #3a3aff; outline: none; }
+</style>
+</head>
+<body>
+
+<h1>Attention-Aware Video Player</h1>
+
+<div id="status-banner">Loading model…</div>
+
+<div id="main-row">
+
+  <!-- Left: webcam + info -->
+  <div id="cam-col">
+    <div id="video-wrap">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>Gaze Directions</h3>
+      <div class="dir-grid">
+        <div class="dir-item"><span class="dir-label">Face H</span><span class="dir-value" id="d-fh">—</span></div>
+        <div class="dir-item"><span class="dir-label">Face V</span><span class="dir-value" id="d-fv">—</span></div>
+        <div class="dir-item"><span class="dir-label">Eye H</span><span class="dir-value" id="d-eh">—</span></div>
+        <div class="dir-item"><span class="dir-label">Eye V</span><span class="dir-value" id="d-ev">—</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Raw Ratios</h3>
+      <div id="ratio-grid">
+        <div class="ratio-row"><span>Face H</span><span id="r-fh">—</span></div>
+        <div class="ratio-row"><span>Face V</span><span id="r-fv">—</span></div>
+        <div class="ratio-row"><span>L Eye H</span><span id="r-leh">—</span></div>
+        <div class="ratio-row"><span>L Eye V</span><span id="r-lev">—</span></div>
+        <div class="ratio-row"><span>R Eye H</span><span id="r-reh">—</span></div>
+        <div class="ratio-row"><span>R Eye V</span><span id="r-rev">—</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>State Changes</h3>
+      <ul id="log-list"><li>Waiting…</li></ul>
+    </div>
+
+    <div class="card" id="crop-card" style="display:none">
+      <h3>Mouse Region Preview</h3>
+      <canvas id="crop-canvas" width="320" height="320"></canvas>
+      <div id="dwell-indicator" class="dwell-bar"></div>
+    </div>
+
+    <div class="card" id="llm-card" style="display:none">
+      <h3>Screen Reading</h3>
+      <div id="llm-status" class="llm-status">Idle</div>
+      <div id="llm-output" class="llm-output"></div>
+    </div>
+
+    <div class="card" id="api-card">
+      <h3>LLM API Settings</h3>
+      <label class="api-label">API URL
+        <input type="text" id="api-url" class="api-input" value="https://aigc-api.hkust-gz.edu.cn/v1/chat/completions">
+      </label>
+      <label class="api-label">API Key
+        <input type="password" id="api-key" class="api-input" value="" placeholder="Paste API key at runtime">
+      </label>
+      <label class="api-label">Crop Size (px)
+        <input type="number" id="crop-size" class="api-input" value="400" min="100" max="1200" step="50">
+      </label>
+    </div>
+  </div>
+
+  <!-- Right: video player + controls -->
+  <div id="player-col">
+    <div id="player-wrap">
+      <div id="player-placeholder">
+        Load a video file or capture your screen,<br>
+        then start the camera.<br><br>
+        The video will <strong>pause automatically</strong><br>
+        when you look away.
+      </div>
+      <video id="local-player" controls style="display:none"></video>
+      <video id="screen-video" autoplay playsinline muted style="display:none"></video>
+    </div>
+
+    <div id="override-note" style="display:none">
+      Attention detection active — video plays/pauses automatically.
+    </div>
+
+    <div id="controls-row">
+      <button id="btn-cam" disabled>Start Camera</button>
+      <button id="btn-file">Load Video File</button>
+      <button id="btn-screen">Capture Screen</button>
+      <button id="btn-stop-screen">Stop Screen</button>
+      <input type="file" id="file-input" accept="video/*">
+    </div>
+    <div id="loader-txt">Loading MediaPipe model…</div>
+  </div>
+
+</div>
+
+<script type="module">
+import {
+  FaceLandmarker,
+  FilesetResolver,
+  DrawingUtils
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM_PATH  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL_PATH = "/face_landmarker.task";   // served locally — avoids Google Storage latency
+
+// ── Landmark indices ──────────────────────────────────────────────────────────
+const IDX = {
+  LEFT_EYE_OUTER: 33,  LEFT_EYE_INNER: 173,
+  RIGHT_EYE_OUTER: 263, RIGHT_EYE_INNER: 398,
+  LEFT_EYE_TOP: 222,   LEFT_EYE_BOTTOM: 230,
+  RIGHT_EYE_TOP: 442,  RIGHT_EYE_BOTTOM: 450,
+  LEFT_PUPIL: 468,     RIGHT_PUPIL: 473,
+  NOSE: 4, CHIN: 152,  FOREHEAD: 10,
+};
+
+// ── Thresholds (from attention_thresholds.json) ───────────────────────────────
+const T = {
+  FACE_VERTICAL_DOWN: 0.66,   FACE_VERTICAL_UP: 0.46,
+  FACE_HORIZONTAL_RIGHT: 0.77, FACE_HORIZONTAL_LEFT: 0.34,
+  EYE_VERTICAL_DOWN: 0.49,    EYE_VERTICAL_UP: 0.34,
+  EYE_HORIZONTAL_RIGHT: 0.66, EYE_HORIZONTAL_LEFT: 0.35,
+};
+
+function ratio(p1, p2, p3) {
+  const d = Math.abs(p1 - p3);
+  return d !== 0 ? Math.abs(p1 - p2) / d : 0;
+}
+
+function getRatios(lm) {
+  return {
+    FACE_HORIZONTAL:      ratio(lm[IDX.LEFT_EYE_OUTER].x,  lm[IDX.NOSE].x,         lm[IDX.RIGHT_EYE_OUTER].x),
+    FACE_VERTICAL:        ratio(lm[IDX.FOREHEAD].y,          lm[IDX.NOSE].y,          lm[IDX.CHIN].y),
+    LEFT_EYE_HORIZONTAL:  ratio(lm[IDX.LEFT_EYE_OUTER].x,  lm[IDX.LEFT_PUPIL].x,   lm[IDX.LEFT_EYE_INNER].x),
+    LEFT_EYE_VERTICAL:    ratio(lm[IDX.LEFT_EYE_TOP].y,    lm[IDX.LEFT_PUPIL].y,   lm[IDX.LEFT_EYE_BOTTOM].y),
+    RIGHT_EYE_HORIZONTAL: ratio(lm[IDX.RIGHT_EYE_INNER].x, lm[IDX.RIGHT_PUPIL].x,  lm[IDX.RIGHT_EYE_OUTER].x),
+    RIGHT_EYE_VERTICAL:   ratio(lm[IDX.RIGHT_EYE_TOP].y,   lm[IDX.RIGHT_PUPIL].y,  lm[IDX.RIGHT_EYE_BOTTOM].y),
+  };
+}
+
+function classify(val, loKey, hiKey, loLabel, hiLabel) {
+  if (val > T[hiKey]) return hiLabel;
+  if (val < T[loKey]) return loLabel;
+  return "Center";
+}
+
+function getDirections(r) {
+  const fh = classify(r.FACE_HORIZONTAL, "FACE_HORIZONTAL_LEFT", "FACE_HORIZONTAL_RIGHT", "Left", "Right");
+  const fv = classify(r.FACE_VERTICAL,   "FACE_VERTICAL_UP",     "FACE_VERTICAL_DOWN",    "Up",   "Down");
+  const lev = r.LEFT_EYE_VERTICAL, rev = r.RIGHT_EYE_VERTICAL;
+  const ev = (lev > T.EYE_VERTICAL_DOWN || rev > T.EYE_VERTICAL_DOWN) ? "Down"
+           : (lev < T.EYE_VERTICAL_UP   || rev < T.EYE_VERTICAL_UP)   ? "Up" : "Center";
+  const leh = r.LEFT_EYE_HORIZONTAL, reh = r.RIGHT_EYE_HORIZONTAL;
+  const eh = (leh > T.EYE_HORIZONTAL_RIGHT || reh > T.EYE_HORIZONTAL_RIGHT) ? "Right"
+           : (leh < T.EYE_HORIZONTAL_LEFT  || reh < T.EYE_HORIZONTAL_LEFT)  ? "Left" : "Center";
+  return { fh, fv, eh, ev };
+}
+
+function isAttentive({ fh, fv, eh, ev }) {
+  return (fv === "Center" && fh === "Center" && ev === "Center" && eh === "Center")
+      || (fv === "Up"    && ev === "Down")
+      || (fv === "Down"  && ev === "Up")
+      || (fh === "Left"  && eh === "Right")
+      || (fh === "Right" && eh === "Left");
+}
+
+// ── DOM ───────────────────────────────────────────────────────────────────────
+const webcam       = document.getElementById("webcam");
+const canvas       = document.getElementById("overlay");
+const ctx          = canvas.getContext("2d");
+const banner       = document.getElementById("status-banner");
+const btnCam       = document.getElementById("btn-cam");
+const btnFile      = document.getElementById("btn-file");
+const btnScreen    = document.getElementById("btn-screen");
+const btnStopScr   = document.getElementById("btn-stop-screen");
+const fileInput    = document.getElementById("file-input");
+const localPlayer  = document.getElementById("local-player");
+const screenVideo  = document.getElementById("screen-video");
+const placeholder  = document.getElementById("player-placeholder");
+const overrideNote = document.getElementById("override-note");
+const loaderTxt    = document.getElementById("loader-txt");
+const logList      = document.getElementById("log-list");
+const dFH = document.getElementById("d-fh"), dFV = document.getElementById("d-fv");
+const dEH = document.getElementById("d-eh"), dEV = document.getElementById("d-ev");
+const rFH = document.getElementById("r-fh"), rFV = document.getElementById("r-fv");
+const rLEH = document.getElementById("r-leh"), rLEV = document.getElementById("r-lev");
+const rREH = document.getElementById("r-reh"), rREV = document.getElementById("r-rev");
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const HISTORY_LEN = 5;
+const history = [];
+let attentionState = null;
+let landmarker = null;
+let camRunning = false;
+let lastVideoTime = -1;
+
+// The "controlled player" — whichever video is active (local file or screen)
+function getActivePlayer() {
+  if (localPlayer.style.display !== "none" && localPlayer.src) return localPlayer;
+  return null; // screen capture is live — no play/pause control
+}
+
+function pushHistory(val) {
+  history.push(val);
+  if (history.length > HISTORY_LEN) history.shift();
+}
+
+function checkState() {
+  if (history.length < HISTORY_LEN) return null;
+  if (history.every(Boolean)) return true;
+  if (history.every(v => !v)) return false;
+  return null;
+}
+
+function addLog(msg, cls) {
+  const li = document.createElement("li");
+  li.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+  if (cls) li.className = cls;
+  logList.prepend(li);
+  while (logList.children.length > 40) logList.removeChild(logList.lastChild);
+}
+
+function setDirEl(el, val) {
+  el.textContent = val;
+  el.className = "dir-value" + (val !== "Center" && val !== "—" ? " off-center" : "");
+}
+
+function applyAttentionToPlayer(attentive) {
+  const p = getActivePlayer();
+  if (!p) return;
+  if (attentive) {
+    p.play().catch(() => {});
+  } else {
+    p.pause();
+  }
+}
+
+// ── Load MediaPipe model ──────────────────────────────────────────────────────
+const filesetResolver = await FilesetResolver.forVisionTasks(WASM_PATH);
+landmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+  baseOptions: {
+    modelAssetPath: MODEL_PATH,
+    delegate: "CPU",
+  },
+  runningMode: "VIDEO",
+  numFaces: 1,
+  minFaceDetectionConfidence: 0.5,
+  minFacePresenceConfidence: 0.5,
+  minTrackingConfidence: 0.5,
+});
+banner.textContent = "Model ready — start camera to begin";
+loaderTxt.textContent = "Model loaded.";
+btnCam.disabled = false;
+
+// ── Camera ────────────────────────────────────────────────────────────────────
+btnCam.addEventListener("click", async () => {
+  if (camRunning) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    webcam.srcObject = stream;
+    await new Promise(res => webcam.addEventListener("loadeddata", res, { once: true }));
+    canvas.width  = webcam.videoWidth  || 320;
+    canvas.height = webcam.videoHeight || 240;
+    webcam.style.width  = canvas.style.width  = canvas.width  + "px";
+    webcam.style.height = canvas.style.height = canvas.height + "px";
+    camRunning = true;
+    btnCam.disabled = true;
+    btnCam.textContent = "Camera On";
+    addLog("Camera started", "");
+    requestAnimationFrame(processFrame);
+  } catch (e) {
+    loaderTxt.textContent = "Camera error: " + e.message;
+  }
+});
+
+// ── Load local video file ─────────────────────────────────────────────────────
+btnFile.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  localPlayer.src = URL.createObjectURL(file);
+  localPlayer.style.display = "block";
+  screenVideo.style.display = "none";
+  placeholder.style.display = "none";
+  overrideNote.style.display = "block";
+  addLog(`Loaded: ${file.name}`, "");
+});
+
+// ── Screen capture ────────────────────────────────────────────────────────────
+btnScreen.addEventListener("click", async () => {
+  try {
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { cursor: "always" },
+      audio: false,
+    });
+    screenVideo.srcObject = stream;
+    screenVideo.style.display = "block";
+    localPlayer.style.display = "none";
+    placeholder.style.display = "none";
+    overrideNote.style.display = "none";
+    btnStopScr.style.display = "inline-block";
+    addLog("Screen capture started", "");
+    startScreenReading();
+
+    stream.getVideoTracks()[0].addEventListener("ended", () => {
+      screenVideo.style.display = "none";
+      placeholder.style.display = "block";
+      btnStopScr.style.display = "none";
+      stopScreenReading();
+      addLog("Screen capture ended", "");
+    });
+  } catch (e) {
+    loaderTxt.textContent = "Screen capture error: " + e.message;
+  }
+});
+
+btnStopScr.addEventListener("click", () => {
+  if (screenVideo.srcObject) {
+    screenVideo.srcObject.getTracks().forEach(t => t.stop());
+    screenVideo.srcObject = null;
+  }
+  screenVideo.style.display = "none";
+  placeholder.style.display = "block";
+  btnStopScr.style.display = "none";
+  stopScreenReading();
+  addLog("Screen capture stopped", "");
+});
+
+// ── Per-frame attention processing ───────────────────────────────────────────
+const drawUtils = new DrawingUtils(ctx);
+
+function processFrame() {
+  if (!camRunning) return;
+  requestAnimationFrame(processFrame);
+
+  if (webcam.currentTime === lastVideoTime) return;
+  lastVideoTime = webcam.currentTime;
+
+  const result = landmarker.detectForVideo(webcam, performance.now());
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!result.faceLandmarks || result.faceLandmarks.length === 0) {
+    pushHistory(false);
+    const ns = checkState();
+    if (ns !== null && ns !== attentionState) {
+      attentionState = ns;
+      banner.textContent = "DISTRACTED — no face detected";
+      banner.className = "distracted";
+      addLog("→ PAUSE (no face)", "pause");
+      applyAttentionToPlayer(false);
+    } else if (attentionState === null) {
+      banner.textContent = "Detecting…";
+      banner.className = "";
+    }
+    setDirEl(dFH, "—"); setDirEl(dFV, "—");
+    setDirEl(dEH, "—"); setDirEl(dEV, "—");
+    return;
+  }
+
+  const lm = result.faceLandmarks[0];
+
+  // Draw face mesh overlay
+  drawUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_TESSELATION,
+    { color: "#1a3a2a", lineWidth: 0.5 });
+  drawUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
+    { color: "#3ddc84", lineWidth: 1.5 });
+  drawUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
+    { color: "#3ddc84", lineWidth: 1.5 });
+  drawUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_FACE_OVAL,
+    { color: "#2a4a3a", lineWidth: 1 });
+
+  // Iris dots
+  const W = canvas.width, H = canvas.height;
+  for (const idx of [IDX.LEFT_PUPIL, IDX.RIGHT_PUPIL]) {
+    ctx.beginPath();
+    ctx.arc(lm[idx].x * W, lm[idx].y * H, 4, 0, 2 * Math.PI);
+    ctx.fillStyle = "#f0a500";
+    ctx.fill();
+  }
+
+  const ratios = getRatios(lm);
+  const dirs   = getDirections(ratios);
+  const attn   = isAttentive(dirs);
+
+  pushHistory(attn);
+  const ns = checkState();
+  if (ns !== null && ns !== attentionState) {
+    attentionState = ns;
+    if (attentionState) {
+      banner.textContent = "ATTENTIVE  →  PLAY";
+      banner.className = "attentive";
+      addLog("→ PLAY", "play");
+    } else {
+      banner.textContent = "DISTRACTED  →  PAUSE";
+      banner.className = "distracted";
+      addLog("→ PAUSE", "pause");
+    }
+    applyAttentionToPlayer(attentionState);
+  } else if (attentionState === null) {
+    banner.textContent = attn ? "Detecting… (attentive)" : "Detecting… (distracted)";
+    banner.className = "";
+  }
+
+  setDirEl(dFH, dirs.fh); setDirEl(dFV, dirs.fv);
+  setDirEl(dEH, dirs.eh); setDirEl(dEV, dirs.ev);
+  rFH.textContent  = ratios.FACE_HORIZONTAL.toFixed(3);
+  rFV.textContent  = ratios.FACE_VERTICAL.toFixed(3);
+  rLEH.textContent = ratios.LEFT_EYE_HORIZONTAL.toFixed(3);
+  rLEV.textContent = ratios.LEFT_EYE_VERTICAL.toFixed(3);
+  rREH.textContent = ratios.RIGHT_EYE_HORIZONTAL.toFixed(3);
+  rREV.textContent = ratios.RIGHT_EYE_VERTICAL.toFixed(3);
+}
+
+// ── Screen Reading: Mouse-Region Crop + LLM Context ─────────────────────────
+let mouseX = 0, mouseY = 0;
+let lastMoveTime = Date.now();
+let lastMoveX = 0, lastMoveY = 0;
+let dwellTriggered = false;
+let llmInFlight = false;
+let cropAnimId = null;
+
+const DWELL_THRESHOLD_MS = 3000;
+const DWELL_RADIUS_PX = 50;
+const DEFAULT_CROP_SIZE = 400;
+
+const cropCanvas = document.getElementById("crop-canvas");
+const cropCtx = cropCanvas.getContext("2d");
+const cropCard = document.getElementById("crop-card");
+const dwellIndicator = document.getElementById("dwell-indicator");
+const llmCard = document.getElementById("llm-card");
+const llmStatus = document.getElementById("llm-status");
+const llmOutput = document.getElementById("llm-output");
+const apiUrlInput = document.getElementById("api-url");
+const apiKeyInput = document.getElementById("api-key");
+const cropSizeInput = document.getElementById("crop-size");
+
+const offCanvas = document.createElement("canvas");
+const offCtx = offCanvas.getContext("2d");
+
+document.addEventListener("mousemove", (e) => {
+  mouseX = e.clientX;
+  mouseY = e.clientY;
+  const dx = mouseX - lastMoveX;
+  const dy = mouseY - lastMoveY;
+  if (Math.sqrt(dx * dx + dy * dy) > DWELL_RADIUS_PX) {
+    lastMoveX = mouseX;
+    lastMoveY = mouseY;
+    lastMoveTime = Date.now();
+    dwellTriggered = false;
+  }
+});
+
+function getFrameCoords() {
+  const screenPosX = window.screenX + mouseX;
+  const screenPosY = window.screenY + (window.outerHeight - window.innerHeight) + mouseY;
+  const vw = screenVideo.videoWidth;
+  const vh = screenVideo.videoHeight;
+  const dpr = window.devicePixelRatio || 1;
+  const sw = screen.width * dpr;
+  const sh = screen.height * dpr;
+  const frameX = (screenPosX * dpr) * (vw / sw);
+  const frameY = (screenPosY * dpr) * (vh / sh);
+  return { frameX, frameY, vw, vh };
+}
+
+// MORE_SCREEN_READING_JS
+
+function updateCropPreview() {
+  if (!screenVideo.srcObject || screenVideo.videoWidth === 0) {
+    cropAnimId = requestAnimationFrame(updateCropPreview);
+    return;
+  }
+
+  const { frameX, frameY, vw, vh } = getFrameCoords();
+  const cropSize = parseInt(cropSizeInput.value) || DEFAULT_CROP_SIZE;
+
+  if (offCanvas.width !== vw || offCanvas.height !== vh) {
+    offCanvas.width = vw;
+    offCanvas.height = vh;
+  }
+
+  offCtx.drawImage(screenVideo, 0, 0, vw, vh);
+
+  const halfCrop = cropSize / 2;
+  const actualSize = Math.min(cropSize, vw, vh);
+  let sx = Math.round(frameX - halfCrop);
+  let sy = Math.round(frameY - halfCrop);
+  sx = Math.max(0, Math.min(sx, vw - actualSize));
+  sy = Math.max(0, Math.min(sy, vh - actualSize));
+
+  cropCtx.clearRect(0, 0, 320, 320);
+  cropCtx.drawImage(offCanvas, sx, sy, actualSize, actualSize, 0, 0, 320, 320);
+
+  const elapsed = Date.now() - lastMoveTime;
+  const progress = Math.min(elapsed / DWELL_THRESHOLD_MS, 1);
+  dwellIndicator.style.setProperty("--dwell-progress", (progress * 100) + "%");
+
+  if (progress >= 1 && !dwellTriggered && !llmInFlight) {
+    dwellTriggered = true;
+    triggerLLMCall(sx, sy, actualSize);
+  }
+
+  cropAnimId = requestAnimationFrame(updateCropPreview);
+}
+
+function startScreenReading() {
+  cropCard.style.display = "block";
+  llmCard.style.display = "block";
+  cropAnimId = requestAnimationFrame(updateCropPreview);
+}
+
+function stopScreenReading() {
+  cropCard.style.display = "none";
+  if (cropAnimId) {
+    cancelAnimationFrame(cropAnimId);
+    cropAnimId = null;
+  }
+}
+
+// MORE_LLM_CALL_JS
+
+async function triggerLLMCall(sx, sy, size) {
+  const apiUrl = apiUrlInput.value.trim();
+  const apiKey = apiKeyInput.value.trim();
+
+  if (!apiUrl || !apiKey) {
+    llmStatus.textContent = "No API key/URL configured";
+    llmStatus.className = "llm-status error";
+    return;
+  }
+
+  llmInFlight = true;
+  llmStatus.textContent = "Analyzing…";
+  llmStatus.className = "llm-status loading";
+
+  try {
+    // Full screen capture (scaled down to 1024px wide for token efficiency)
+    const screenCanvas = document.createElement("canvas");
+    const scaleW = Math.min(1024, offCanvas.width);
+    const scaleH = Math.round(offCanvas.height * (scaleW / offCanvas.width));
+    screenCanvas.width = scaleW;
+    screenCanvas.height = scaleH;
+    const screenCtx = screenCanvas.getContext("2d");
+    screenCtx.drawImage(offCanvas, 0, 0, scaleW, scaleH);
+    const screenDataUrl = screenCanvas.toDataURL("image/jpeg", 0.8);
+    const screenBase64 = screenDataUrl.split(",")[1];
+
+    // Cropped mouse surroundings (512x512)
+    const cropSendCanvas = document.createElement("canvas");
+    cropSendCanvas.width = 512;
+    cropSendCanvas.height = 512;
+    const cropSendCtx = cropSendCanvas.getContext("2d");
+    cropSendCtx.drawImage(offCanvas, sx, sy, size, size, 0, 0, 512, 512);
+    const cropDataUrl = cropSendCanvas.toDataURL("image/jpeg", 0.85);
+    const cropBase64 = cropDataUrl.split(",")[1];
+
+    const payload = {
+      model: "gpt-4-turbo",
+      max_tokens: 1024,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "You are analyzing a user's working context from their screen. Two images are provided:\n\n1. FULL SCREEN — the user's entire screen capture, showing all visible applications and layout.\n2. MOUSE SURROUNDINGS — a cropped square region centered on where the user's mouse cursor is currently pointing.\n\nThe MOUSE SURROUNDINGS image is the primary indicator of the user's current focus and working context. The mouse position reveals what the user is actively interacting with or about to interact with. Use it as the key reference for determining their task.\n\nThe FULL SCREEN provides broader context (other open windows, tabs, panels) to help you understand the overall workflow.\n\nBased on both images, briefly describe:\n- What the user is currently working on (inferred from mouse position)\n- The application and content type under the cursor\n- The likely immediate task or intent\n\nBe concise (2-4 sentences).",
+          },
+          {
+            type: "image_url",
+            image_url: { url: `data:image/jpeg;base64,${screenBase64}` },
+          },
+          {
+            type: "image_url",
+            image_url: { url: `data:image/jpeg;base64,${cropBase64}` },
+          },
+        ],
+      }],
+    };
+
+    // Route through local proxy to avoid CORS
+    payload._api_url = apiUrl;
+    payload._api_key = apiKey;
+
+    const resp = await fetch("/api/llm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`API ${resp.status}: ${errText.slice(0, 200)}`);
+    }
+
+    const data = await resp.json();
+    const text = data.choices?.[0]?.message?.content || "(no response)";
+    llmOutput.textContent = text;
+    llmStatus.textContent = "Done";
+    llmStatus.className = "llm-status done";
+    addLog("Screen reading complete", "play");
+  } catch (err) {
+    llmOutput.textContent = err.message;
+    llmStatus.textContent = "Error";
+    llmStatus.className = "llm-status error";
+    addLog("Screen reading error", "pause");
+  } finally {
+    llmInFlight = false;
+  }
+}
+</script>
+</body>
+</html>
