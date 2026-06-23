@@ -12,6 +12,7 @@
     "function/monitor/index.html",
     "function/monitor/server.py",
     "function/monitor/config.example.json",
+    "function/monitor/src/main.ts",
     "function/monitor/test_vision_support.py",
     "function/monitor/HANDOVER.md"
   ]
