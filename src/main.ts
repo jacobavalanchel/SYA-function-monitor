@@ -2,13 +2,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type {
   FunctionAdapter,
+  FunctionActionHandler,
   FunctionManifest,
   MonitorAdapterContext,
 } from './types';
 
 export const manifest: FunctionManifest = {
   id: 'monitor',
-  version: '0.1.0',
+  version: '0.1.3',
   capabilities: [
     'screen-monitoring',
     'camera-monitoring',
@@ -31,6 +32,31 @@ interface RatePayload {
 interface LimitPayload {
   limit?: number;
 }
+
+interface InvokePayload {
+  action: string;
+  payload?: unknown;
+}
+
+const ACTION_DEFINITIONS = [
+  { action: 'health', method: 'GET', path: '/health', description: 'Check monitor runtime health.' },
+  { action: 'manifest', method: 'GET', path: '/manifest', description: 'Read monitor runtime manifest.' },
+  { action: 'actions.list', method: 'GET', path: '/api/monitor/actions', description: 'List callable monitor actions.' },
+  { action: 'capabilities.list', method: 'GET', path: '/api/monitor/capabilities', description: 'List monitor capabilities, events, permissions, and actions.' },
+  { action: 'invoke', method: 'POST', path: '/api/monitor/invoke', description: 'Invoke a monitor action by action name.' },
+  { action: 'screen.status', method: 'GET', path: '/api/monitor/screen/status', description: 'Read screen monitor status.' },
+  { action: 'screen.start', method: 'POST', path: '/api/monitor/screen/start', description: 'Start screen monitoring.' },
+  { action: 'screen.stop', method: 'POST', path: '/api/monitor/screen/stop', description: 'Stop screen monitoring.' },
+  { action: 'camera.status', method: 'GET', path: '/api/monitor/camera/status', description: 'Read camera monitor status.' },
+  { action: 'camera.start', method: 'POST', path: '/api/monitor/camera/start', description: 'Start camera monitoring.' },
+  { action: 'camera.stop', method: 'POST', path: '/api/monitor/camera/stop', description: 'Stop camera monitoring.' },
+  { action: 'camera.show', method: 'POST', path: '/api/monitor/camera/show', description: 'Show the camera monitor window.' },
+  { action: 'camera.hide', method: 'POST', path: '/api/monitor/camera/hide', description: 'Hide the camera monitor window.' },
+  { action: 'storage.stats', method: 'GET', path: '/api/monitor/storage/stats', description: 'Read monitor storage statistics.' },
+  { action: 'storage.screenRecords', method: 'GET', path: '/api/monitor/storage/screen-records', description: 'List stored screen records.' },
+  { action: 'storage.cameraRecords', method: 'GET', path: '/api/monitor/storage/camera-records', description: 'List stored camera records.' },
+  { action: 'attention.config.status', method: 'GET', path: '/api/monitor/attention/config/status', description: 'Read attention LLM config status.' },
+];
 
 function readObjectPayload(payload: unknown): Record<string, unknown> {
   if (payload === undefined || payload === null) return {};
@@ -56,6 +82,17 @@ function readLimitPayload(payload: unknown): LimitPayload {
     throw new Error('Payload limit must be a positive integer.');
   }
   return { limit: data.limit };
+}
+
+function readInvokePayload(payload: unknown): InvokePayload {
+  const data = readObjectPayload(payload);
+  if (typeof data.action !== 'string' || !data.action) {
+    throw new Error('Payload action must be a non-empty string.');
+  }
+  return {
+    action: data.action,
+    payload: data.payload,
+  };
 }
 
 function getAttentionConfigStatus(moduleRoot: string) {
@@ -96,11 +133,18 @@ function getAttentionConfigStatus(moduleRoot: string) {
 }
 
 export function createAdapter(context: MonitorAdapterContext): FunctionAdapter {
-  return {
-    manifest,
-    actions: {
+  const actions: Record<string, FunctionActionHandler> = {
       health: () => ({ status: 'ok', functionId: manifest.id, version: manifest.version }),
       manifest: () => manifest,
+      'actions.list': () => ACTION_DEFINITIONS,
+      'capabilities.list': () => ({
+        id: manifest.id,
+        version: manifest.version,
+        capabilities: manifest.capabilities,
+        events: manifest.events,
+        permissions: manifest.permissions,
+        actions: ACTION_DEFINITIONS,
+      }),
       'screen.start': (payload) => {
         const { rateMs } = readRatePayload(payload);
         const status = context.monitor.startScreen(rateMs);
@@ -136,6 +180,22 @@ export function createAdapter(context: MonitorAdapterContext): FunctionAdapter {
         return context.monitor.getCameraRecords(limit);
       },
       'attention.config.status': () => getAttentionConfigStatus(context.moduleRoot),
-    },
+  };
+
+  actions.invoke = (payload: unknown) => {
+    const next = readInvokePayload(payload);
+    if (next.action === 'invoke') {
+      throw new Error('Nested invoke is not supported.');
+    }
+    const handler = actions[next.action];
+    if (!handler) {
+      throw new Error(`Unknown monitor action: ${next.action}`);
+    }
+    return handler(next.payload);
+  };
+
+  return {
+    manifest,
+    actions,
   };
 }

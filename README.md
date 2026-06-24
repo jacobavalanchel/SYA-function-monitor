@@ -18,8 +18,60 @@ Private Git submodule for SYA local focus monitoring.
 - `app/src/pages/MonitorTestPage.tsx`
 - `app/src/types/electron.d.ts`
 
-Runtime code is still wired through the main app. Move implementation here once
-the private submodule repository is created and published.
+The Electron app can load monitor through the packaged artifact runtime when
+`app/function-runtime/monitor/<platform-arch>` is prepared, and falls back to
+the source adapter during local development.
+
+## Function Artifact API
+
+The monitor artifact exposes a local HTTP API documented in
+`api.openapi.json`. Electron maps each OpenAPI `operationId` to a Function API
+action, so the UI can call:
+
+```ts
+await window.sya.functions.invoke('monitor', 'screen.status', {});
+await window.sya.functions.invoke('monitor', 'camera.show', {});
+await window.sya.functions.invoke('monitor', 'actions.list', {});
+```
+
+Discovery and generic invocation endpoints:
+
+| Method | Path | Function action |
+| --- | --- | --- |
+| `GET` | `/api/monitor/actions` | `actions.list` |
+| `GET` | `/api/monitor/capabilities` | `capabilities.list` |
+| `POST` | `/api/monitor/invoke` | `invoke` |
+
+Generic invoke request:
+
+```json
+{
+  "action": "screen.start",
+  "payload": {
+    "rateMs": 10000
+  }
+}
+```
+
+Operational monitor endpoints:
+
+| Method | Path | Function action |
+| --- | --- | --- |
+| `GET` | `/health` | `health` |
+| `GET` | `/manifest` | `manifest` |
+| `GET` | `/api/monitor/screen/status` | `screen.status` |
+| `POST` | `/api/monitor/screen/start` | `screen.start` |
+| `POST` | `/api/monitor/screen/stop` | `screen.stop` |
+| `GET` | `/api/monitor/camera/status` | `camera.status` |
+| `POST` | `/api/monitor/camera/start` | `camera.start` |
+| `POST` | `/api/monitor/camera/stop` | `camera.stop` |
+| `POST` | `/api/monitor/camera/show` | `camera.show` |
+| `POST` | `/api/monitor/camera/hide` | `camera.hide` |
+| `GET` | `/api/monitor/storage/stats` | `storage.stats` |
+| `GET` | `/api/monitor/storage/screen-records` | `storage.screenRecords` |
+| `GET` | `/api/monitor/storage/camera-records` | `storage.cameraRecords` |
+| `GET` | `/api/monitor/attention/config/status` | `attention.config.status` |
+| `GET` | `/api/monitor/events` | `events` |
 
 ## Webcam Attention Demo
 

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "SYA Monitor Function API",
-    "version": "0.1.2"
+    "version": "0.1.3"
   },
   "paths": {
     "/health": {
@@ -32,6 +32,74 @@
               "application/json": {
                 "schema": {
                   "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/actions": {
+      "get": {
+        "operationId": "actions.list",
+        "responses": {
+          "200": {
+            "description": "Callable monitor action list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/capabilities": {
+      "get": {
+        "operationId": "capabilities.list",
+        "responses": {
+          "200": {
+            "description": "Monitor capabilities, events, permissions, and actions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/invoke": {
+      "post": {
+        "operationId": "invoke",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                  "action": {
+                    "type": "string"
+                  },
+                  "payload": {}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Invoked monitor action result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
                 }
               }
             }
@@ -146,6 +214,40 @@
         "responses": {
           "200": {
             "description": "Stopped camera monitoring",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/camera/show": {
+      "post": {
+        "operationId": "camera.show",
+        "responses": {
+          "200": {
+            "description": "Showed the camera monitor window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/monitor/camera/hide": {
+      "post": {
+        "operationId": "camera.hide",
+        "responses": {
+          "200": {
+            "description": "Hid the camera monitor window",
             "content": {
               "application/json": {
                 "schema": {

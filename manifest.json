@@ -1,6 +1,6 @@
 {
   "id": "monitor",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "runtime": "local-http",
   "entry": {
     "command": "bin/monitor-server",
@@ -14,8 +14,17 @@
     },
     "events": {
       "transport": "sse",
-      "path": "/events"
+      "path": "/api/monitor/events"
     }
   },
+  "capabilities": [
+    "screen-monitoring",
+    "camera-monitoring",
+    "record-storage",
+    "attention-config",
+    "action-discovery",
+    "generic-invoke"
+  ],
+  "events": ["screen.capture", "camera.frame", "screen.status", "camera.status"],
   "permissions": ["screen", "camera", "storage"]
 }
