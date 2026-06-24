@@ -6,11 +6,11 @@ on:
       tag:
         description: "Release tag, for example v0.1.0"
         required: true
-        default: "v0.1.1"
+        default: "v0.1.2"
       version:
         description: "Artifact version, for example 0.1.0"
         required: true
-        default: "0.1.1"
+        default: "0.1.2"
   push:
     tags:
       - "v*"
@@ -76,11 +76,67 @@ jobs:
           module_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
           exec python3 "${module_root}/assets/server.py" "$@"
           SCRIPT
+          cat > release/stage/bin/monitor-server.cmd <<'SCRIPT'
+          @echo off
+          set MODULE_ROOT=%~dp0..
+          python "%MODULE_ROOT%\assets\server.py" %*
+          SCRIPT
           chmod +x release/stage/bin/monitor-server
           test -f release/stage/manifest.json
           test -f release/stage/api.openapi.json
           test -x release/stage/bin/monitor-server
+          test -f release/stage/bin/monitor-server.cmd
           test -d release/stage/assets
+
+      - name: Smoke test staged runtime API
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PORT=9876
+          ./release/stage/bin/monitor-server > release/monitor-smoke.log 2>&1 &
+          server_pid="$!"
+          cleanup() {
+            kill "${server_pid}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          node --input-type=module <<'NODE'
+          const baseUrl = 'http://127.0.0.1:9876';
+          const endpoints = [
+            ['/health', true],
+            ['/manifest', false],
+            ['/api/monitor/screen/status', true],
+            ['/api/monitor/camera/status', true],
+            ['/api/monitor/attention/config/status', true],
+          ];
+
+          async function waitForHealth() {
+            const deadline = Date.now() + 10000;
+            let lastError;
+            while (Date.now() < deadline) {
+              try {
+                const response = await fetch(`${baseUrl}/health`);
+                if (response.ok) return;
+              } catch (error) {
+                lastError = error;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 250));
+            }
+            throw new Error(`monitor runtime did not become healthy: ${lastError?.message || 'timeout'}`);
+          }
+
+          await waitForHealth();
+          for (const [path, expectEnvelope] of endpoints) {
+            const response = await fetch(`${baseUrl}${path}`);
+            if (!response.ok) {
+              throw new Error(`${path} returned HTTP ${response.status}`);
+            }
+            const body = await response.json();
+            if (expectEnvelope && body.ok !== true) {
+              throw new Error(`${path} did not return a successful FunctionResponse envelope`);
+            }
+          }
+          NODE
 
       - name: Create platform archives
         shell: bash
