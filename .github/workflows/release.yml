@@ -101,14 +101,48 @@ jobs:
           trap cleanup EXIT
 
           node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+
           const baseUrl = 'http://127.0.0.1:9876';
-          const endpoints = [
-            ['/health', true],
-            ['/manifest', false],
-            ['/api/monitor/screen/status', true],
-            ['/api/monitor/camera/status', true],
-            ['/api/monitor/attention/config/status', true],
-          ];
+          const openApi = JSON.parse(readFileSync('release/stage/api.openapi.json', 'utf8'));
+
+          function responseContent(operation) {
+            return operation.responses?.['200']?.content || {};
+          }
+
+          function isEventStream(operation) {
+            return Boolean(responseContent(operation)['text/event-stream']);
+          }
+
+          function requestBodyFor(operation) {
+            const requestBody = operation.requestBody;
+            if (!requestBody) return undefined;
+            const schema = requestBody.content?.['application/json']?.schema;
+            if (Array.isArray(schema?.required) && schema.required.length > 0) return null;
+            return {};
+          }
+
+          function discoverTests() {
+            const tests = [];
+            for (const [path, pathItem] of Object.entries(openApi.paths || {})) {
+              if (path.includes('{') || path.includes('}')) continue;
+              for (const method of ['get', 'post']) {
+                const operation = pathItem?.[method];
+                if (!operation) continue;
+                if (isEventStream(operation)) continue;
+                if (!responseContent(operation)['application/json']) continue;
+                const body = method === 'post' ? requestBodyFor(operation) : undefined;
+                if (body === null) continue;
+                tests.push({
+                  method: method.toUpperCase(),
+                  path,
+                  body,
+                  expectEnvelope: path !== '/manifest',
+                });
+              }
+            }
+            return tests;
+          }
 
           async function waitForHealth() {
             const deadline = Date.now() + 10000;
@@ -126,16 +160,24 @@ jobs:
           }
 
           await waitForHealth();
-          for (const [path, expectEnvelope] of endpoints) {
-            const response = await fetch(`${baseUrl}${path}`);
+          const tests = discoverTests();
+          if (tests.length === 0) throw new Error('api.openapi.json has no testable JSON endpoints');
+          for (const test of tests) {
+            const init = { method: test.method };
+            if (test.body !== undefined) {
+              init.headers = { 'Content-Type': 'application/json' };
+              init.body = JSON.stringify(test.body);
+            }
+            const response = await fetch(`${baseUrl}${test.path}`, init);
             if (!response.ok) {
-              throw new Error(`${path} returned HTTP ${response.status}`);
+              throw new Error(`${test.method} ${test.path} returned HTTP ${response.status}`);
             }
             const body = await response.json();
-            if (expectEnvelope && body.ok !== true) {
-              throw new Error(`${path} did not return a successful FunctionResponse envelope`);
+            if (test.expectEnvelope && body.ok !== true) {
+              throw new Error(`${test.method} ${test.path} did not return a successful FunctionResponse envelope`);
             }
           }
+          console.log(`OpenAPI smoke tested ${tests.length} endpoints.`);
           NODE
 
       - name: Create platform archives
