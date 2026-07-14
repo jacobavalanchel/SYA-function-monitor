@@ -3,5 +3,23 @@
     "path": "https://aigc-api.hkust-gz.edu.cn/v1/chat/completions",
     "key": "",
     "model": "gpt-4-turbo"
+  },
+  "camera": {
+    "defaultSource": "builtin",
+    "realsense": {
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "colorWidth": 640,
+      "colorHeight": 480,
+      "colorFps": 30,
+      "depthWidth": 640,
+      "depthHeight": 480,
+      "depthFps": 30,
+      "enableColor": true,
+      "enableDepth": true,
+      "serial": "",
+      "recordsDir": ""
+    }
   }
 }

@@ -23,8 +23,17 @@
     "record-storage",
     "attention-config",
     "action-discovery",
-    "generic-invoke"
+    "generic-invoke",
+    "realsense-rgbd-source",
+    "training-data-capture"
   ],
-  "events": ["screen.capture", "camera.frame", "screen.status", "camera.status"],
+  "events": [
+    "screen.capture",
+    "camera.frame",
+    "screen.status",
+    "camera.status",
+    "realsense.frame",
+    "realsense.training.sample"
+  ],
   "permissions": ["screen", "camera", "storage"]
 }

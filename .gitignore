@@ -14,6 +14,7 @@ config.local.json
 # Logs and local output
 *.log
 logs/
+records/
 dist/
 release/
 build/

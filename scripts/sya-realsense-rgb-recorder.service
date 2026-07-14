@@ -1,0 +1,13 @@
+[Unit]
+Description=SYA Intel RealSense RGB hourly recorder
+After=default.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 %h/sya-monitor-realsense-test/function/monitor/scripts/realsense_rgb_recorder.py --record-dir %h/realsense-rgb-recordings --home-path /home --min-free-gb 20 --segment-seconds 3600 --width 1280 --height 720 --fps 30
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

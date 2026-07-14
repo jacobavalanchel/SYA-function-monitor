@@ -1,0 +1,102 @@
+{
+  "screen": {
+    "isMonitoring": false,
+    "captureRateMs": 10000,
+    "activeWindow": "Visual Studio Code — SYA-UI/app/src/pages/DashboardPage.tsx",
+    "idleTimeSeconds": 3,
+    "totalCaptures": 247,
+    "lastCaptureTime": "2026-07-02T09:41:17.452Z",
+    "storagePath": "~/Library/Application Support/sya-ui/sya-records/screenshots/"
+  },
+  "camera": {
+    "isActive": false,
+    "windowCreated": false,
+    "faceDetected": false,
+    "totalFrames": 0,
+    "lastFrameTime": null,
+    "storagePath": "~/Library/Application Support/sya-ui/sya-records/camera/"
+  },
+  "storage": {
+    "totalRecords": 247,
+    "screenshotsDir": "~/Library/Application Support/sya-ui/sya-records/screenshots/",
+    "cameraDir": "~/Library/Application Support/sya-ui/sya-records/camera/",
+    "logsDir": "~/Library/Application Support/sya-ui/sya-records/logs/",
+    "diskUsageMB": 45.2
+  },
+  "screenRecords": [
+    {
+      "id": "scr-001",
+      "timestamp": "2026-07-02T09:41:17.452Z",
+      "activeWindow": "Visual Studio Code — SYA-UI/app/src/pages/DashboardPage.tsx",
+      "idleTimeSeconds": 3,
+      "filePath": "screenshots/scr-001.png",
+      "fileSizeBytes": 245760
+    },
+    {
+      "id": "scr-002",
+      "timestamp": "2026-07-02T09:40:07.123Z",
+      "activeWindow": "Google Chrome — GitHub Pull Request #142 — SYA-UI",
+      "idleTimeSeconds": 0,
+      "filePath": "screenshots/scr-002.png",
+      "fileSizeBytes": 312400
+    },
+    {
+      "id": "scr-003",
+      "timestamp": "2026-07-02T09:39:57.098Z",
+      "activeWindow": "iTerm2 — htop — SYA monitor server",
+      "idleTimeSeconds": 0,
+      "filePath": "screenshots/scr-003.png",
+      "fileSizeBytes": 188920
+    },
+    {
+      "id": "scr-004",
+      "timestamp": "2026-07-02T09:39:47.045Z",
+      "activeWindow": "Finder — ~/Desktop/SYA-UI/function/monitor",
+      "idleTimeSeconds": 12,
+      "filePath": "screenshots/scr-004.png",
+      "fileSizeBytes": 156300
+    },
+    {
+      "id": "scr-005",
+      "timestamp": "2026-07-02T09:39:37.001Z",
+      "activeWindow": "Slack — #engineering — SYA team",
+      "idleTimeSeconds": 45,
+      "filePath": "screenshots/scr-005.png",
+      "fileSizeBytes": 201100
+    }
+  ],
+  "cameraRecords": [
+    {
+      "id": "cam-001",
+      "timestamp": "2026-07-02T09:41:00.500Z",
+      "faceDetected": true,
+      "filePath": "camera/cam-001.jpg",
+      "fileSizeBytes": 49020
+    },
+    {
+      "id": "cam-002",
+      "timestamp": "2026-07-02T09:40:57.500Z",
+      "faceDetected": true,
+      "filePath": "camera/cam-002.jpg",
+      "fileSizeBytes": 48150
+    },
+    {
+      "id": "cam-003",
+      "timestamp": "2026-07-02T09:40:54.500Z",
+      "faceDetected": false,
+      "filePath": "camera/cam-003.jpg",
+      "fileSizeBytes": 43100
+    }
+  ],
+  "attentionConfig": {
+    "configured": false,
+    "apiPath": "",
+    "model": "gpt-4-turbo",
+    "configFile": "",
+    "attentionStatus": "unknown",
+    "confidence": 0,
+    "source": "mock-seed",
+    "reason": "initial mock state",
+    "lastUpdatedAt": "2026-07-02T09:41:17.452Z"
+  }
+}
