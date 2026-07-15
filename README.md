@@ -6,6 +6,8 @@ Private Git submodule for SYA local focus monitoring.
 
 - Screen monitoring.
 - Camera monitoring.
+- Intel RealSense camera source for monitor, inference, and training capture.
+- RealSense 2D RGB recording with configurable segmenting and disk cleanup.
 - Local monitor record storage.
 - Monitor test and permission validation hooks.
 - Webcam attention detection demo and LLM screen reading prototype.
@@ -87,6 +89,14 @@ The monitor runtime can expose an Intel RealSense RGB-D camera as a camera data
 source for inference and training capture. The adapter is optional: the server
 still starts when the RealSense SDK, `pyrealsense2`, or hardware is unavailable,
 and `realsense.status` reports the missing dependency or device state.
+
+In the SYA desktop app, `/#/settings` is the user-facing configuration surface
+for RealSense. It lets the user choose built-in vs RealSense source, select a
+device serial, set save location, segment duration or file-size split policy,
+minimum free-space cleanup, codec/container, resolution, FPS, bitrate, and CRF.
+The settings page applies an RGB-only recording path: depth is disabled for this
+path so SYA records 2D RGB video for monitor, inference, and training source
+capture.
 
 Install the Intel RealSense SDK and Python bindings in the environment that
 runs `server.py`:
@@ -186,6 +196,53 @@ Each sample contains:
   }
 }
 ```
+
+For the RGB-only settings-page path, set `enableDepth` to `false` and keep
+`enableColor` as `true`.
+
+### Linux RealSense RGB Recorder
+
+For Linux hosts where the RealSense RGB stream is exposed through V4L2, the
+repository includes a standalone recorder at
+`function/monitor/scripts/realsense_rgb_recorder.py`.
+
+Example:
+
+```bash
+python3 function/monitor/scripts/realsense_rgb_recorder.py \
+  --record-dir ~/realsense-rgb-recordings \
+  --home-path /home \
+  --segment-seconds 3600 \
+  --min-free-gb 20
+```
+
+The recorder:
+
+- scans `/dev/video*` for Intel RealSense RGB/YUYV devices,
+- records RGB video with `ffmpeg`,
+- writes one `.mp4` file per segment, one hour by default,
+- monitors remaining space under `/home` by default,
+- deletes the oldest completed `.mp4` segment when free space drops below the
+  threshold,
+- records no depth stream and no audio.
+
+Required host tools:
+
+- `ffmpeg`
+- `v4l2-ctl`
+- `udevadm`
+
+Useful environment variables:
+
+- `REALSENSE_RGB_DEVICE`
+- `REALSENSE_RGB_RECORD_DIR`
+- `REALSENSE_RGB_HOME_PATH`
+- `REALSENSE_RGB_MIN_FREE_GB`
+- `REALSENSE_RGB_SEGMENT_SECONDS`
+- `REALSENSE_RGB_WIDTH`
+- `REALSENSE_RGB_HEIGHT`
+- `REALSENSE_RGB_FPS`
+- `REALSENSE_RGB_X264_CRF`
 
 ## Mock Server
 
