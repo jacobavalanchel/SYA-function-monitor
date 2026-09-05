@@ -2,6 +2,7 @@
 """Install and diagnose the pinned SYA Intel RealSense L515 runtime."""
 
 import argparse
+import contextlib
 import datetime
 import gc
 import hashlib
@@ -16,6 +17,11 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - installer is macOS-only
+    fcntl = None
 
 
 SDK_VERSION = "2.54.2"
@@ -82,6 +88,34 @@ def patch_sha256():
         for chunk in iter(lambda: patch_file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+@contextlib.contextmanager
+def install_locks(paths):
+    if fcntl is None:
+        raise RuntimeError("Filesystem locking is unavailable on this platform.")
+    handles = []
+    try:
+        for lock_path in sorted({Path(path).resolve() for path in paths}, key=str):
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+", encoding="utf-8")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                handle.close()
+                raise RuntimeError(f"Another RealSense installation is using {lock_path}.") from error
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"pid={os.getpid()}\n")
+            handle.flush()
+            handles.append(handle)
+        yield
+    finally:
+        for handle in reversed(handles):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
 
 def import_status(module_name):
@@ -417,21 +451,14 @@ def install_runtime(args):
     if not libusb_library.is_file() or not libusb_headers.is_dir():
         raise RuntimeError("Homebrew libusb is missing. Install it with: brew install libusb")
 
-    root.mkdir(parents=True, exist_ok=True)
-    lock_path = root / ".install.lock"
-    try:
-        lock_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as error:
-        raise RuntimeError(f"Another RealSense installation is active: {lock_path}") from error
-    try:
-        os.write(lock_descriptor, f"pid={os.getpid()}\n".encode("ascii"))
+    with install_locks(
+        [
+            root / ".install.lock",
+            source.parent / f".{source.name}.sya-install.lock",
+            venv.parent / f".{venv.name}.sya-install.lock",
+        ]
+    ):
         _install_runtime(args, root, venv, source, libusb_prefix)
-    finally:
-        os.close(lock_descriptor)
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _install_runtime(args, root, venv, source, libusb_prefix):
@@ -603,18 +630,18 @@ def _install_runtime(args, root, venv, source, libusb_prefix):
 
 
 def smoke(args):
-    try:
-        import pyrealsense2 as rs
-    except Exception as error:
-        raise RuntimeError(f"pyrealsense2 is unavailable: {error}") from error
-
     pipeline = None
     started = False
     color_frames = 0
     depth_frames = 0
     first_frame_ms = None
     started_at = time.monotonic()
+    result = None
+    sdk_version = ""
     try:
+        import pyrealsense2 as rs
+
+        sdk_version = getattr(rs, "__version__", "")
         l515_devices = []
         for device in list(rs.context().query_devices()):
             product_id = device.get_info(rs.camera_info.product_id)
@@ -656,12 +683,13 @@ def smoke(args):
             "ok": color_frames == (args.frames if enable_color else 0)
             and depth_frames == (args.frames if enable_depth else 0)
             and product_id == L515_PRODUCT_ID
-            and firmware == SUPPORTED_FIRMWARE,
+            and firmware == SUPPORTED_FIRMWARE
+            and sdk_version == SDK_VERSION,
             "serialNumber": serial,
             "productId": product_id,
             "firmwareVersion": firmware,
             "firmwareSupported": firmware == SUPPORTED_FIRMWARE,
-            "sdkVersion": rs.__version__,
+            "sdkVersion": sdk_version,
             "requestedFrames": args.frames,
             "colorFrames": color_frames,
             "depthFrames": depth_frames,
@@ -673,6 +701,7 @@ def smoke(args):
         result = {
             "ok": False,
             "error": str(error),
+            "sdkVersion": sdk_version,
             "usbDevices": usb,
             "privilegeRequired": bool(
                 sys.platform == "darwin"
@@ -684,8 +713,9 @@ def smoke(args):
         if started:
             try:
                 pipeline.stop()
-            except Exception:
-                pass
+            except Exception as error:
+                result["ok"] = False
+                result["releaseError"] = str(error)
         pipeline = None
         gc.collect()
 

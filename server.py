@@ -3,6 +3,7 @@
 
 import http.server
 import array
+import hmac
 import json
 import os
 import queue
@@ -32,6 +33,11 @@ DEFAULT_RECORDS_DIR = os.environ.get(
     os.path.join(os.path.expanduser("~"), ".sya", "monitor", "records"),
 )
 USER_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".sya", "monitor", "config.local.json")
+L515_PRODUCT_ID = "0b64"
+SUPPORTED_L515_FIRMWARE = "1.5.8.1"
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
+PUBLIC_ASSET_PATHS = {"/", "/index.html", "/face_landmarker.task"}
+RUNTIME_TOKEN = os.environ.get("FUNCTION_RUNTIME_TOKEN", "").strip()
 
 ACTION_DEFINITIONS = [
     {"action": "health", "method": "GET", "path": "/health", "description": "Check monitor runtime health."},
@@ -164,6 +170,7 @@ class RealSenseAdapter:
         self.worker = None
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
+        self.lifecycle_lock = threading.Lock()
         self.frame_condition = threading.Condition(self.lock)
         self.stream_config = {
             "width": 640,
@@ -224,7 +231,15 @@ class RealSenseAdapter:
             except Exception:
                 continue
         info["sdkAccessible"] = True
+        if info.get("productId"):
+            info["productId"] = str(info["productId"]).lower().removeprefix("0x").zfill(4)
         return info
+
+    def _is_l515_info(self, info):
+        return str(info.get("productId", "")).lower().removeprefix("0x").zfill(4) == L515_PRODUCT_ID
+
+    def _is_supported_l515_info(self, info):
+        return self._is_l515_info(info) and info.get("firmwareVersion") == SUPPORTED_L515_FIRMWARE
 
     def _query_devices(self):
         rs = self._load_sdk()
@@ -402,10 +417,24 @@ class RealSenseAdapter:
         try:
             devices = []
             for device in self._query_devices():
-                devices.append(self._device_info(device))
+                info = self._device_info(device)
+                if self._is_l515_info(info):
+                    devices.append(info)
             with self.lock:
                 self.device_cache = devices
-                self.last_error = ""
+                if devices and not any(self._is_supported_l515_info(device) for device in devices):
+                    versions = sorted({device.get("firmwareVersion", "unknown") for device in devices})
+                    self.last_error = (
+                        f"Intel RealSense L515 firmware must be {SUPPORTED_L515_FIRMWARE}; "
+                        f"detected {', '.join(versions)}. Firmware updates are never performed automatically."
+                    )
+                elif devices:
+                    self.last_error = ""
+                else:
+                    self.last_error = (
+                        self._inaccessible_usb_message()
+                        or "No SDK-accessible Intel RealSense L515 was detected."
+                    )
             return devices
         except Exception as error:
             with self.lock:
@@ -431,6 +460,7 @@ class RealSenseAdapter:
         sdk_devices = cached_devices if active and cached_devices else (
             self.list_devices() if not self.import_error else []
         )
+        compatible_devices = [device for device in sdk_devices if self._is_supported_l515_info(device)]
         usb_devices = [] if sdk_devices else self._usb_realsense_devices()
         error = self.last_error or self.import_error
         if not error and usb_devices:
@@ -439,7 +469,7 @@ class RealSenseAdapter:
         focus_error = detector.error if detector is not None else ""
         return {
             "source": "realsense",
-            "available": bool(self.rs and sdk_devices),
+            "available": bool(self.rs and compatible_devices),
             "sdkLoaded": bool(self.rs),
             "sdkVersion": getattr(self.rs, "__version__", "") if self.rs is not None else "",
             "backend": "pyrealsense2",
@@ -589,8 +619,12 @@ class RealSenseAdapter:
 
                 color_frame = frames.get_color_frame()
                 depth_frame = frames.get_depth_frame()
+                if self.stream_config.get("enableColor") and not color_frame:
+                    raise RuntimeError("RealSense frameset is missing the configured color stream.")
+                if self.stream_config.get("enableDepth") and not depth_frame:
+                    raise RuntimeError("RealSense frameset is missing the configured depth stream.")
                 if not color_frame and not depth_frame:
-                    continue
+                    raise RuntimeError("RealSense returned an empty frameset.")
 
                 now_monotonic = time.monotonic()
                 timestamp_ms = int(time.time() * 1000)
@@ -716,8 +750,10 @@ class RealSenseAdapter:
                     self.latest_raw_frame = None
                     self.active = False
                     CAMERA_STATE["isActive"] = False
+                    CAMERA_STATE["faceDetected"] = False
                     if CAMERA_STATE.get("source") == "realsense":
                         CAMERA_STATE["source"] = "builtin"
+                    self.frame_condition.notify_all()
                 else:
                     detector = None
             if detector:
@@ -744,7 +780,15 @@ class RealSenseAdapter:
                 return None
             return json.loads(json.dumps(self.latest_frame_data))
 
+    def is_running(self):
+        with self.lock:
+            return self.active or self.pipeline is not None
+
     def start(self, payload=None):
+        with self.lifecycle_lock:
+            return self._start(payload)
+
+    def _start(self, payload=None):
         with self.lock:
             if self.active:
                 return self.status()
@@ -764,22 +808,44 @@ class RealSenseAdapter:
             self.last_error = message
             raise RuntimeError(message)
 
-        selected_devices = devices
-        if config_values["serial"]:
-            selected_devices = [
-                device for device in devices if self._device_serial(device) == config_values["serial"]
-            ]
-            if not selected_devices:
-                message = f"Intel RealSense device with serial {config_values['serial']} was not detected."
-                self.last_error = message
-                raise RuntimeError(message)
+        selected_devices = []
+        selected_info = None
+        for device in devices:
+            info = self._device_info(device)
+            if not self._is_l515_info(info):
+                continue
+            if config_values["serial"] and info.get("serialNumber") != config_values["serial"]:
+                continue
+            selected_devices.append(device)
+            selected_info = info
+            break
+        if not selected_devices or selected_info is None:
+            target = f" with serial {config_values['serial']}" if config_values["serial"] else ""
+            message = self._inaccessible_usb_message() or (
+                f"No SDK-accessible Intel RealSense L515{target} was detected."
+            )
+            self.last_error = message
+            raise RuntimeError(message)
+        if not self._is_supported_l515_info(selected_info):
+            firmware = selected_info.get("firmwareVersion", "unknown")
+            message = (
+                f"Intel RealSense L515 firmware must be {SUPPORTED_L515_FIRMWARE}; detected {firmware}. "
+                "The Monitor runtime never updates camera firmware automatically."
+            )
+            self.last_error = message
+            raise RuntimeError(message)
+        selected_serial = selected_info.get("serialNumber", "")
+        if not selected_serial:
+            message = "The selected Intel RealSense L515 did not report a serial number."
+            self.last_error = message
+            raise RuntimeError(message)
 
         pipeline = rs.pipeline()
         config = rs.config()
         detector = None
 
-        if config_values["serial"]:
-            config.enable_device(config_values["serial"])
+        config.enable_device(selected_serial)
+        config_values["serial"] = selected_serial
         if config_values["enableColor"]:
             color_profile = self._choose_video_profile(
                 selected_devices,
@@ -884,6 +950,10 @@ class RealSenseAdapter:
             raise RuntimeError(self.last_error) from error
 
     def stop(self, _payload=None):
+        with self.lifecycle_lock:
+            return self._stop(_payload)
+
+    def _stop(self, _payload=None):
         with self.lock:
             pipeline = self.pipeline
             worker = self.worker
@@ -920,8 +990,10 @@ class RealSenseAdapter:
             self.latest_raw_frame = None
             self.active = False
             CAMERA_STATE["isActive"] = False
+            CAMERA_STATE["faceDetected"] = False
             if CAMERA_STATE.get("source") == "realsense":
                 CAMERA_STATE["source"] = "builtin"
+            self.frame_condition.notify_all()
 
         if was_active:
             timestamp_ms = int(time.time() * 1000)
@@ -1093,7 +1165,7 @@ class RealSenseAdapter:
         if os.path.commonpath([records_root, session_path]) != records_root:
             raise ValueError("RealSense training path must stay inside the configured records directory.")
 
-        self.training_session = {
+        session = {
             "sessionId": session_id,
             "label": payload.get("label") if isinstance(payload.get("label"), str) else "",
             "taskId": payload.get("taskId") if isinstance(payload.get("taskId"), str) else "",
@@ -1101,9 +1173,21 @@ class RealSenseAdapter:
             "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "path": session_path,
         }
-        os.makedirs(self.training_session["path"], mode=0o700, exist_ok=True)
-        if payload.get("autoStart", True) is not False:
-            self.start(payload)
+        path_existed = os.path.exists(session_path)
+        os.makedirs(session["path"], mode=0o700, exist_ok=True)
+        previous_session = self.training_session
+        self.training_session = session
+        try:
+            if payload.get("autoStart", True) is not False:
+                self.start(payload)
+        except Exception:
+            self.training_session = previous_session
+            if not path_existed:
+                try:
+                    os.rmdir(session_path)
+                except OSError:
+                    pass
+            raise
         return self.status()
 
     def training_stop(self, payload=None):
@@ -1340,6 +1424,10 @@ def camera_start(_payload=None):
     payload = _payload if isinstance(_payload, dict) else {}
     if payload.get("source") == "realsense" or payload.get("dataSource") == "realsense":
         return REALSENSE.start(payload)
+    if REALSENSE.is_running():
+        status = REALSENSE.stop()
+        if status.get("active"):
+            raise RuntimeError("RealSense did not stop; refusing to activate a second camera source.")
     CAMERA_STATE["source"] = "builtin"
     CAMERA_STATE["isActive"] = True
     CAMERA_STATE["windowCreated"] = True
@@ -1348,7 +1436,11 @@ def camera_start(_payload=None):
 
 def camera_stop(_payload=None):
     payload = _payload if isinstance(_payload, dict) else {}
-    if payload.get("source") == "realsense" or CAMERA_STATE.get("source") == "realsense":
+    if (
+        payload.get("source") == "realsense"
+        or CAMERA_STATE.get("source") == "realsense"
+        or REALSENSE.is_running()
+    ):
         return REALSENSE.stop(payload)
     CAMERA_STATE["isActive"] = False
     return CAMERA_STATE
@@ -1434,7 +1526,34 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=STATIC_DIR, **kwargs)
 
+    def _request_authorized(self):
+        host = self.headers.get("Host", "")
+        hostname = host.rsplit(":", 1)[0].strip("[]").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1"}:
+            self._send_json(403, error_response("FORBIDDEN", "Monitor runtime accepts loopback requests only."))
+            return False
+
+        if RUNTIME_TOKEN:
+            authorization = self.headers.get("Authorization", "")
+            if not hmac.compare_digest(authorization, f"Bearer {RUNTIME_TOKEN}"):
+                self._send_json(401, error_response("UNAUTHORIZED", "Missing or invalid runtime token."))
+                return False
+            return True
+
+        if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+            self._send_json(403, error_response("FORBIDDEN", "Cross-site runtime requests are not allowed."))
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urllib.parse.urlparse(origin)
+            if parsed_origin.scheme != "http" or parsed_origin.netloc.lower() != host.lower():
+                self._send_json(403, error_response("FORBIDDEN", "Cross-origin runtime requests are not allowed."))
+                return False
+        return True
+
     def do_GET(self):
+        if not self._request_authorized():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = dict(urllib.parse.parse_qsl(parsed.query))
@@ -1463,13 +1582,27 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._send_config_status()
         elif path == "/api/monitor/events":
             self._send_event_stream()
-        else:
+        elif path in PUBLIC_ASSET_PATHS:
             super().do_GET()
+        else:
+            self.send_error(404)
+
+    def do_HEAD(self):
+        if not self._request_authorized():
+            return
+        if urllib.parse.urlparse(self.path).path in PUBLIC_ASSET_PATHS:
+            super().do_HEAD()
+        else:
+            self.send_error(404)
 
     def do_POST(self):
+        if not self._request_authorized():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         payload = self._read_json_body()
+        if payload is None:
+            return
 
         routes = {
             "/api/monitor/screen/start": "screen.start",
@@ -1496,22 +1629,41 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404)
 
     def _read_json_body(self):
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_json(400, error_response("INVALID_PAYLOAD", "Content-Length must be an integer."))
+            return None
+        if content_length > MAX_REQUEST_BODY_BYTES:
+            self._send_json(413, error_response("PAYLOAD_TOO_LARGE", "Request body exceeds 1 MiB."))
+            return None
         if content_length <= 0:
             return {}
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._send_json(415, error_response("UNSUPPORTED_MEDIA_TYPE", "Request body must be JSON."))
+            return None
 
         body = self.rfile.read(content_length)
         try:
-            return json.loads(body)
+            payload = json.loads(body)
         except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
-            return {}
+            self._send_json(400, error_response("INVALID_PAYLOAD", "Request body contains invalid JSON."))
+            return None
+        if payload is None:
+            self._send_json(400, error_response("INVALID_PAYLOAD", "Request body must not be null."))
+            return None
+        return payload
 
     def _send_json(self, status_code, payload):
+        body = json.dumps(payload).encode()
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(json.dumps(payload).encode())
+        self.wfile.write(body)
 
     def _send_action(self, action, payload=None, query=None):
         try:

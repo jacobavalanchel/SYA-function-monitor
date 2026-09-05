@@ -175,12 +175,29 @@ class RealSenseAdapterTests(unittest.TestCase):
         pipeline = OneFramePipeline(adapter, EmptyColorFrameSet())
         adapter.pipeline = pipeline
         adapter.active = True
+        adapter.stream_config["enableColor"] = False
         adapter.stream_config["focusEnabled"] = False
         adapter._stream_loop(pipeline, adapter.stop_event)
         self.assertIsNone(adapter.latest_frame())
         self.assertIsNotNone(adapter.latest_raw_frame["depthBytes"])
         self.assertIsNone(adapter.latest_raw_frame["colorBytes"])
         self.assertEqual(adapter.total_frames, 1)
+
+    def test_missing_configured_color_stream_reports_unknown(self):
+        adapter = server.RealSenseAdapter()
+        pipeline = OneFramePipeline(adapter, EmptyColorFrameSet())
+        adapter.pipeline = pipeline
+        adapter.active = True
+        subscriber = server.EVENT_BROKER.subscribe()
+        try:
+            adapter._stream_loop(pipeline, adapter.stop_event)
+            event = subscriber.get(timeout=1)
+        finally:
+            server.EVENT_BROKER.unsubscribe(subscriber)
+        self.assertFalse(adapter.active)
+        self.assertIsNone(adapter.latest_raw_frame)
+        self.assertIn("missing the configured color", adapter.last_error)
+        self.assertEqual(event["payload"]["state"], "unknown")
 
     def test_acquisition_failure_clears_stale_frames_and_emits_unknown(self):
         adapter = server.RealSenseAdapter()
@@ -259,6 +276,16 @@ class RealSenseAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "sessionId"):
                 adapter.training_start({"sessionId": "../../outside", "autoStart": False})
 
+    def test_failed_training_start_rolls_back_session(self):
+        adapter = server.RealSenseAdapter()
+        with tempfile.TemporaryDirectory() as records_dir:
+            adapter._records_dir = lambda: records_dir
+            with mock.patch.object(adapter, "start", side_effect=RuntimeError("camera unavailable")):
+                with self.assertRaisesRegex(RuntimeError, "camera unavailable"):
+                    adapter.training_start({"sessionId": "failed-session"})
+            self.assertIsNone(adapter.training_session)
+            self.assertFalse(os.path.exists(os.path.join(records_dir, "realsense", "failed-session")))
+
     def test_records_directory_expands_home(self):
         adapter = server.RealSenseAdapter()
         with mock.patch.object(server, "load_realsense_config", return_value={"recordsDir": "~/captures"}):
@@ -268,6 +295,30 @@ class RealSenseAdapterTests(unittest.TestCase):
         self.assertIsNone(server.dispatch_action("realsense.frame.latest"))
         actions = {definition["action"] for definition in server.ACTION_DEFINITIONS}
         self.assertIn("realsense.frame.latest", actions)
+
+    def test_start_rejects_non_l515_device(self):
+        adapter = server.RealSenseAdapter()
+        adapter.rs = object()
+        device = object()
+        with mock.patch.object(adapter, "_query_devices", return_value=[device]), mock.patch.object(
+            adapter,
+            "_device_info",
+            return_value={"productId": "0b07", "firmwareVersion": "1.5.8.1"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "L515"):
+                adapter.start()
+
+    def test_start_rejects_unsupported_l515_firmware(self):
+        adapter = server.RealSenseAdapter()
+        adapter.rs = object()
+        device = object()
+        with mock.patch.object(adapter, "_query_devices", return_value=[device]), mock.patch.object(
+            adapter,
+            "_device_info",
+            return_value={"productId": "0b64", "firmwareVersion": "1.5.7.1", "serialNumber": "abc"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "firmware must be 1.5.8.1"):
+                adapter.start()
 
 
 if __name__ == "__main__":
