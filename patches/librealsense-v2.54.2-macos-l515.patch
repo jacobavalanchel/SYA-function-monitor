@@ -1,90 +1,114 @@
+diff --git a/CMake/lrs_options.cmake b/CMake/lrs_options.cmake
+index e61f5a20a..60b7ecc8f 100644
+--- a/CMake/lrs_options.cmake
++++ b/CMake/lrs_options.cmake
+@@ -20,0 +21 @@ option(BUILD_PYTHON_BINDINGS "Build Python bindings" OFF)
++option(BUILD_LEGACY_PYBACKEND "Build deprecated Python backend bindings" OFF)
 diff --git a/CMake/unix_config.cmake b/CMake/unix_config.cmake
+index 1a8bd74db..a76db02cc 100644
 --- a/CMake/unix_config.cmake
 +++ b/CMake/unix_config.cmake
-@@ -18,12 +18,12 @@ macro(os_set_flags)
-     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-switch -Wno-multichar -Wsequence-point -Wformat -Wformat-security")
-
-     execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpmachine OUTPUT_VARIABLE MACHINE)
+@@ -21,4 +21 @@ macro(os_set_flags)
 -    if(${MACHINE} MATCHES "arm-*")
 -        set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -mfpu=neon -mfloat-abi=hard -ftree-vectorize -latomic")
 -        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfpu=neon -mfloat-abi=hard -ftree-vectorize -latomic")
 -    elseif(${MACHINE} MATCHES "aarch64-*")
 +    if(${MACHINE} MATCHES "arm64-*" OR ${MACHINE} MATCHES "aarch64-*")
-         set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -mstrict-align -ftree-vectorize")
-         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mstrict-align -ftree-vectorize")
+@@ -26,0 +24,3 @@ macro(os_set_flags)
 +    elseif(${MACHINE} MATCHES "arm-*")
 +        set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -mfpu=neon -mfloat-abi=hard -ftree-vectorize -latomic")
 +        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfpu=neon -mfloat-abi=hard -ftree-vectorize -latomic")
-     elseif(${MACHINE} MATCHES "powerpc64(le)?-linux-gnu")
-         set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -ftree-vectorize")
-         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ftree-vectorize")
-@@ -31,7 +31,7 @@ macro(os_set_flags)
-         set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -mssse3")
-         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mssse3")
-         set(LRS_TRY_USE_AVX true)
+@@ -34 +34 @@ macro(os_set_flags)
 -    endif(${MACHINE} MATCHES "arm-*")
 +    endif(${MACHINE} MATCHES "arm64-*" OR ${MACHINE} MATCHES "aarch64-*")
-
-     if(BUILD_WITH_OPENMP)
-         find_package(OpenMP REQUIRED)
 diff --git a/config/librealsense-gl.pc.in b/config/librealsense-gl.pc.in
+index 626795a8b..d86dcd83f 100644
 --- a/config/librealsense-gl.pc.in
 +++ b/config/librealsense-gl.pc.in
-@@ -1,8 +1,7 @@
- prefix=@CMAKE_INSTALL_PREFIX@
- exec_prefix=${prefix}
- includedir=${prefix}/include
+@@ -4,2 +4 @@ includedir=${prefix}/include
 -#TODO: libdir=${exec_prefix}/lib@MULTI_ARCH_SUFFIX@
 -libdir= ${prefix}/lib/x86_64-linux-gnu
 +libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
-
- Name: realsense2-gl
- Description: Intel(R) RealSense(tm) GLSL Extension Module
 diff --git a/config/librealsense.pc.in b/config/librealsense.pc.in
+index 4a95b31c5..5ac8ba3e0 100644
 --- a/config/librealsense.pc.in
 +++ b/config/librealsense.pc.in
-@@ -1,8 +1,7 @@
- prefix=@CMAKE_INSTALL_PREFIX@
- exec_prefix=${prefix}
- includedir=${prefix}/include
+@@ -4,2 +4 @@ includedir=${prefix}/include
 -#TODO: libdir=${exec_prefix}/lib@MULTI_ARCH_SUFFIX@
 -libdir= ${prefix}/lib/x86_64-linux-gnu
 +libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
-
- Name:
- Description: Intel(R) RealSense(tm) Cross Platform API
 diff --git a/src/context.cpp b/src/context.cpp
+index edc5af028..c00790e72 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
-@@ -428,13 +428,16 @@ namespace librealsense
-
-     void context::unregister_internal_device_callback(uint64_t cb_id)
-     {
+@@ -278 +278,7 @@ namespace librealsense
+-        _device_watcher->stop(); //ensure that the device watcher will stop before the _devices_changed_callback will be deleted
++        stop(); // Ensure the watcher stops before its callbacks are destroyed.
++    }
++
++    void context::stop()
++    {
++        std::lock_guard<std::mutex> watcher_lock(_device_watcher_mtx);
++        _device_watcher->stop();
+@@ -417,3 +423,7 @@ namespace librealsense
+-        std::lock_guard<std::mutex> lock(_devices_changed_callbacks_mtx);
+-        auto callback_id = unique_id::generate_id();
+-        _devices_changed_callbacks.insert(std::make_pair(callback_id, std::move(callback)));
++        std::lock_guard<std::mutex> watcher_lock(_device_watcher_mtx);
++        uint64_t callback_id;
++        {
++            std::lock_guard<std::mutex> lock(_devices_changed_callbacks_mtx);
++            callback_id = unique_id::generate_id();
++            _devices_changed_callbacks.insert(std::make_pair(callback_id, std::move(callback)));
++        }
+@@ -422 +431,0 @@ namespace librealsense
+-        {
+@@ -424 +432,0 @@ namespace librealsense
+-        }
+@@ -431,4 +439,2 @@ namespace librealsense
 -        std::lock_guard<std::mutex> lock(_devices_changed_callbacks_mtx);
 -        _devices_changed_callbacks.erase(cb_id);
 -
 -        if (_devices_changed_callback == nullptr && _devices_changed_callbacks.size() == 0) // There are no register callbacks any more _device_watcher can be stopped
++        std::lock_guard<std::mutex> watcher_lock(_device_watcher_mtx);
 +        bool stop_device_watcher;
-         {
+@@ -436 +442,3 @@ namespace librealsense
 -            _device_watcher->stop();
 +            std::lock_guard<std::mutex> lock(_devices_changed_callbacks_mtx);
 +            _devices_changed_callbacks.erase(cb_id);
 +            stop_device_watcher = _devices_changed_callback == nullptr && _devices_changed_callbacks.empty();
-         }
+@@ -437,0 +446,4 @@ namespace librealsense
 +
 +        // A watcher callback also takes the callbacks mutex, so never wait for it while holding the mutex.
 +        if (stop_device_watcher)
 +            _device_watcher->stop();
-     }
-
-     void context::set_devices_changed_callback(devices_changed_callback_ptr callback)
+@@ -442,2 +454,5 @@ namespace librealsense
+-        std::lock_guard<std::mutex> lock(_devices_changed_callbacks_mtx);
+-        _devices_changed_callback = std::move(callback);
++        std::lock_guard<std::mutex> watcher_lock(_device_watcher_mtx);
++        {
++            std::lock_guard<std::mutex> lock(_devices_changed_callbacks_mtx);
++            _devices_changed_callback = std::move(callback);
++        }
+@@ -446 +460,0 @@ namespace librealsense
+-        {
+@@ -448 +461,0 @@ namespace librealsense
+-        }
+diff --git a/src/context.h b/src/context.h
+index d454666dd..ac5c647c0 100644
+--- a/src/context.h
++++ b/src/context.h
+@@ -108 +108 @@ namespace librealsense
+-        void stop() { _device_watcher->stop(); }
++        void stop();
+@@ -142 +142 @@ namespace librealsense
+-        std::mutex _streams_mutex, _devices_changed_callbacks_mtx;
++        std::mutex _streams_mutex, _devices_changed_callbacks_mtx, _device_watcher_mtx;
 diff --git a/src/l500/l500-device.cpp b/src/l500/l500-device.cpp
+index 8759dddf2..b93edcc1b 100644
 --- a/src/l500/l500-device.cpp
 +++ b/src/l500/l500-device.cpp
-@@ -154,8 +154,16 @@ namespace librealsense
-         auto&& backend = ctx->get_backend();
-
-         std::vector<std::shared_ptr<platform::uvc_device>> depth_devices;
+@@ -157,2 +157,10 @@ namespace librealsense
 -        for( auto&& info : filter_by_mi( all_device_infos, 0 ) ) // Filter just mi=0, DEPTH
 -            depth_devices.push_back( backend.create_uvc_device( info ) );
 +        auto depth_devices_info = filter_by_mi( all_device_infos, 0 );
@@ -97,472 +121,17 @@ diff --git a/src/l500/l500-device.cpp b/src/l500/l500-device.cpp
 +
 +        if( depth_devices_info.empty() || depth_devices.empty() )
 +            throw backend_exception( "cannot access depth sensor", RS2_EXCEPTION_TYPE_BACKEND );
-
-         std::unique_ptr<frame_timestamp_reader> timestamp_reader_metadata( new l500_timestamp_reader_from_metadata( backend.create_time_service() ) );
-         auto enable_global_time_option = std::shared_ptr<global_time_option>( new global_time_option() );
 diff --git a/src/libusb/CMakeLists.txt b/src/libusb/CMakeLists.txt
+index c46eab656..6c4ea8f09 100644
 --- a/src/libusb/CMakeLists.txt
 +++ b/src/libusb/CMakeLists.txt
-@@ -5,6 +5,9 @@ target_sources(${LRS_TARGET}
-         "${CMAKE_CURRENT_LIST_DIR}/context-libusb.h"
-         "${CMAKE_CURRENT_LIST_DIR}/context-libusb.cpp"
-
+@@ -7,0 +8,3 @@ target_sources(${LRS_TARGET}
 +        "${CMAKE_CURRENT_LIST_DIR}/darwin-device-capture.h"
 +        "${CMAKE_CURRENT_LIST_DIR}/darwin-device-capture.cpp"
 +
-         "${CMAKE_CURRENT_LIST_DIR}/handle-libusb.h"
-         "${CMAKE_CURRENT_LIST_DIR}/endpoint-libusb.h"
-         "${CMAKE_CURRENT_LIST_DIR}/interface-libusb.h"
-diff --git a/src/libusb/device-libusb.cpp b/src/libusb/device-libusb.cpp
---- a/src/libusb/device-libusb.cpp
-+++ b/src/libusb/device-libusb.cpp
-@@ -11,6 +11,9 @@ namespace librealsense
-     {
-         usb_device_libusb::usb_device_libusb(libusb_device* device, const libusb_device_descriptor& desc, const usb_device_info& info, std::shared_ptr<usb_context> context) :
-                 _device(device), _usb_device_descriptor(desc), _info(info), _context(context)
-+#if defined(__APPLE__)
-+                , _capture(darwin_device_capture::acquire(context, device, info.mi))
-+#endif
-         {
-             usb_descriptor ud = {desc.bLength, desc.bDescriptorType, std::vector<uint8_t>(desc.bLength)};
-             memcpy(ud.data.data(), &desc, desc.bLength);
-@@ -38,7 +41,7 @@ namespace librealsense
-                         {
-                             if(inf.altsetting->bInterfaceSubClass == RS2_USB_SUBCLASS_VIDEO_CONTROL)
-                                 curr_ctrl_intf = curr_inf;
--                            if(inf.altsetting->bInterfaceSubClass == RS2_USB_SUBCLASS_VIDEO_STREAMING)
-+                            if(inf.altsetting->bInterfaceSubClass == RS2_USB_SUBCLASS_VIDEO_STREAMING && curr_ctrl_intf)
-                                 curr_ctrl_intf->add_associated_interface(curr_inf);
-                             break;
-                         }
-diff --git a/src/libusb/device-libusb.h b/src/libusb/device-libusb.h
---- a/src/libusb/device-libusb.h
-+++ b/src/libusb/device-libusb.h
-@@ -5,6 +5,10 @@
-
- #include "messenger-libusb.h"
-
-+#if defined(__APPLE__)
-+#include "darwin-device-capture.h"
-+#endif
-+
- namespace librealsense
- {
-     namespace platform
-@@ -29,6 +33,9 @@ namespace librealsense
-             std::vector<std::shared_ptr<usb_interface>> _interfaces;
-             std::vector<usb_descriptor> _descriptors;
-             std::shared_ptr<usb_context> _context;
-+#if defined(__APPLE__)
-+            std::shared_ptr<darwin_device_capture> _capture;
-+#endif
-
-             std::shared_ptr<handle_libusb> get_handle(uint8_t interface_number);
-         };
-diff --git a/src/libusb/handle-libusb.h b/src/libusb/handle-libusb.h
---- a/src/libusb/handle-libusb.h
-+++ b/src/libusb/handle-libusb.h
-@@ -42,7 +42,8 @@ namespace librealsense
-         {
-         public:
-             handle_libusb(std::shared_ptr<usb_context> context, libusb_device* device, std::shared_ptr<usb_interface_libusb> interface) :
--                    _first_interface(interface), _context(context), _handle(nullptr)
-+                    _first_interface(interface), _context(context), _handle(nullptr),
-+                    _event_handler_started(false)
-             {
-                 auto sts = libusb_open(device, &_handle);
-                 if(sts != LIBUSB_SUCCESS)
-@@ -54,30 +55,43 @@ namespace librealsense
-                     throw std::runtime_error(msg.str());
-                 }
-
--                sts = libusb_set_auto_detach_kernel_driver(_handle, true); // detach from kernel driver when claimed and re-attach when released.
--                if(sts != LIBUSB_SUCCESS)
-+                try
-                 {
--                    auto rs_sts =  libusb_status_to_rs(sts);
--                    std::stringstream msg;
--                    msg << "failed to set kernel driver auto detach: " << (int)interface->get_number() << ", error: " << usb_status_to_string.at(rs_sts);
--                    LOG_ERROR(msg.str());
--                    throw std::runtime_error(msg.str());
--                }
-+#if defined(__APPLE__)
-+                    sts = libusb_set_auto_detach_kernel_driver(_handle, false);
-+#else
-+                    sts = libusb_set_auto_detach_kernel_driver(_handle, true);
-+#endif
-+                    if(sts != LIBUSB_SUCCESS)
-+                    {
-+                        auto rs_sts = libusb_status_to_rs(sts);
-+                        std::stringstream msg;
-+                        msg << "failed to configure kernel driver detach for interface: "
-+                            << (int)interface->get_number() << ", error: "
-+                            << usb_status_to_string.at(rs_sts);
-+                        LOG_ERROR(msg.str());
-+                        throw std::runtime_error(msg.str());
-+                    }
-
--                claim_interface_or_throw(interface->get_number());
--                for(auto&& i : interface->get_associated_interfaces())
--                    claim_interface_or_throw(i->get_number());
-+                    claim_interface_or_throw(interface->get_number());
-+                    for(auto&& i : interface->get_associated_interfaces())
-+                        claim_interface_or_throw(i->get_number());
-
--                _context->start_event_handler();
-+                    _context->start_event_handler();
-+                    _event_handler_started = true;
-+                }
-+                catch(...)
-+                {
-+                    cleanup();
-+                    throw;
-+                }
-             }
-
-             ~handle_libusb()
-             {
--                _context->stop_event_handler();
--                for(auto&& i : _first_interface->get_associated_interfaces())
--                    libusb_release_interface(_handle, i->get_number());
--                libusb_release_interface(_handle, _first_interface->get_number());
--                libusb_close(_handle);
-+                if(_event_handler_started)
-+                    _context->stop_event_handler();
-+                cleanup();
-             }
-
-             libusb_device_handle* get()
-@@ -91,6 +105,20 @@ namespace librealsense
-                 auto rs_sts = claim_interface(interface);
-                 if(rs_sts != RS2_USB_STATUS_SUCCESS)
-                     throw std::runtime_error(rsutils::string::from() << "Unable to claim interface " << (int)interface << ", error: " << usb_status_to_string.at(rs_sts));
-+                _claimed_interfaces.push_back(interface);
-+            }
-+
-+            void cleanup() noexcept
-+            {
-+                if(!_handle)
-+                    return;
-+
-+                for(auto it = _claimed_interfaces.rbegin(); it != _claimed_interfaces.rend(); ++it)
-+                    libusb_release_interface(_handle, *it);
-+                _claimed_interfaces.clear();
-+
-+                libusb_close(_handle);
-+                _handle = nullptr;
-             }
-
-             usb_status claim_interface(uint8_t interface)
-@@ -134,6 +162,8 @@ namespace librealsense
-             std::shared_ptr<usb_context> _context;
-             std::shared_ptr<usb_interface_libusb> _first_interface;
-             libusb_device_handle* _handle;
-+            bool _event_handler_started;
-+            std::vector<uint8_t> _claimed_interfaces;
-         };
-     }
- }
-diff --git a/src/uvc/uvc-device.cpp b/src/uvc/uvc-device.cpp
---- a/src/uvc/uvc-device.cpp
-+++ b/src/uvc/uvc-device.cpp
-@@ -197,7 +197,7 @@ namespace librealsense
-                             break;
-                     }
-                 }
--            }, [this, state](){ return state == _power_state; });
-+            }, [this, state](){ return state == _power_state; }, true);
-
-             if(state != _power_state)
-                 throw std::runtime_error("failed to set power state");
-@@ -422,8 +422,8 @@ namespace librealsense
-
-         void rs_uvc_device::play_profile(stream_profile profile, frame_callback callback) {
-             bool foundFormat = false;
--
-             uvc_format_t selected_format{};
-+            uint8_t interface_number;
-             // Return list of all available formats inside devices[0]
-             auto formats = get_available_formats_all();
-
-@@ -435,6 +435,7 @@ namespace librealsense
-                     (profile.width == f.width)) {
-                         foundFormat = true;
-                         selected_format = f;
-+                        interface_number = f.interfaceNumber;
-                         break;
-                 }
-             }
-@@ -443,6 +444,12 @@ namespace librealsense
-                 throw std::runtime_error("Failed to find supported format!");
-             }
-
-+            auto inf = _usb_device->get_interface(interface_number);
-+            if (inf == nullptr)
-+                throw std::runtime_error("can't find UVC streaming interface of device: " + _usb_device->get_info().id);
-+            auto _read_endpoint = inf->first_endpoint(platform::RS2_USB_ENDPOINT_DIRECTION_READ);
-+            _messenger->reset_endpoint(_read_endpoint, 5000);
-+
-             auto ctrl = std::make_shared<uvc_stream_ctrl_t>();
-             auto ret = get_stream_ctrl_format_size(selected_format, ctrl);
-             if (ret != RS2_USB_STATUS_SUCCESS) {
-@@ -505,7 +512,7 @@ namespace librealsense
-                             0);
-                 }
-
--            }, [this](){ return !_messenger; });
-+            }, [this](){ return !_messenger; }, true);
-
-             if (sts != RS2_USB_STATUS_SUCCESS)
-                 throw std::runtime_error("get_data_usb failed, error: " + usb_status_to_string.at(sts));
-@@ -595,7 +602,7 @@ namespace librealsense
-                           0);
-                 }
-
--            }, [this](){ return !_messenger; });
-+            }, [this](){ return !_messenger; }, true);
-
-             if (sts != RS2_USB_STATUS_SUCCESS)
-                 throw std::runtime_error("set_data_usb failed, error: " + usb_status_to_string.at(sts));
-@@ -606,7 +613,7 @@ namespace librealsense
-
-         bool rs_uvc_device::uvc_get_ctrl(uint8_t unit, uint8_t ctrl, void *data, int len, uvc_req_code req_code) const
-         {
--            usb_status sts;
-+            usb_status sts = RS2_USB_STATUS_OTHER;
-             _action_dispatcher.invoke_and_wait([&, this](dispatcher::cancellable_timer c)
-             {
-                 if (_messenger)
-@@ -619,7 +626,7 @@ namespace librealsense
-                             static_cast<unsigned char *>(data),
-                             len, transferred, CONTROL_TRANSFER_TIMEOUT);
-                 }
--            }, [this](){ return !_messenger; });
-+            }, [this](){ return !_messenger; }, true);
-
-             if (sts == RS2_USB_STATUS_NO_DEVICE)
-                 throw std::runtime_error("usb device disconnected");
-@@ -629,7 +636,7 @@ namespace librealsense
-
-         bool rs_uvc_device::uvc_set_ctrl(uint8_t unit, uint8_t ctrl, void *data, int len)
-         {
--            usb_status sts;
-+            usb_status sts = RS2_USB_STATUS_OTHER;
-             _action_dispatcher.invoke_and_wait([&, this](dispatcher::cancellable_timer c)
-             {
-                 if (_messenger)
-@@ -642,7 +649,7 @@ namespace librealsense
-                             static_cast<unsigned char *>(data),
-                             len, transferred, CONTROL_TRANSFER_TIMEOUT);
-                 }
--            }, [this](){ return !_messenger; });
-+            }, [this](){ return !_messenger; }, true);
-
-             if (sts == RS2_USB_STATUS_NO_DEVICE)
-                 throw std::runtime_error("usb device disconnected");
-@@ -841,7 +848,7 @@ namespace librealsense
-                 }
-             }
-
--            usb_status sts;
-+            usb_status sts = RS2_USB_STATUS_OTHER;
-             _action_dispatcher.invoke_and_wait([&, this](dispatcher::cancellable_timer c)
-             {
-                 if (_messenger)
-@@ -857,7 +864,7 @@ namespace librealsense
-                                 buf, len, transferred, 0);
-                     } while (sts != RS2_USB_STATUS_SUCCESS && retries++ < 5);
-                 }
--            }, [this](){ return !_messenger; });
-+            }, [this](){ return !_messenger; }, true);
-
-             if (sts != RS2_USB_STATUS_SUCCESS)
-             {
-diff --git a/src/uvc/uvc-streamer.cpp b/src/uvc/uvc-streamer.cpp
---- a/src/uvc/uvc-streamer.cpp
-+++ b/src/uvc/uvc-streamer.cpp
-@@ -171,7 +171,7 @@ namespace librealsense
-
-                 _publish_frame_thread->start();
-
--            }, [this](){ return _running; });
-+            }, [this](){ return _running; }, true);
-         }
-
-         void uvc_streamer::stop()
-@@ -206,7 +206,7 @@ namespace librealsense
-                     _stopped_cv.notify_one();
-                 }
-
--            }, [this](){ return !_running; });
-+            }, [this](){ return !_running; }, true);
-         }
-
-         void uvc_streamer::flush()
-diff --git a/third-party/rsutils/include/rsutils/concurrency/concurrency.h b/third-party/rsutils/include/rsutils/concurrency/concurrency.h
---- a/third-party/rsutils/include/rsutils/concurrency/concurrency.h
-+++ b/third-party/rsutils/include/rsutils/concurrency/concurrency.h
-@@ -8,7 +8,9 @@
- #include <thread>
- #include <atomic>
- #include <functional>
-+#include <memory>
- #include <cassert>
-+#include <exception>
-
- const int QUEUE_MAX_SIZE = 10;
- // Simplest implementation of a blocking concurrent queue for thread messaging
-@@ -310,6 +312,87 @@ public:
-     // An action is any functor that accepts a cancellable timer
-     typedef std::function<void(cancellable_timer const &)> action;
-
-+private:
-+    struct invocation_state
-+    {
-+        std::mutex mutex;
-+        std::condition_variable cv;
-+        bool started = false;
-+        bool done = false;
-+        bool cancelled = false;
-+        std::exception_ptr error;
-+    };
-+
-+    static void finish_invocation(
-+        std::shared_ptr< invocation_state > const & state,
-+        std::exception_ptr error = nullptr )
-+    {
-+        {
-+            std::lock_guard< std::mutex > lock( state->mutex );
-+            state->error = std::move( error );
-+            state->done = true;
-+        }
-+        state->cv.notify_all();
-+    }
-+
-+    template< class T >
-+    static action make_invocation_action( std::shared_ptr< invocation_state > state, T func )
-+    {
-+        return [state, func = std::move( func )]( cancellable_timer const & c ) mutable {
-+            {
-+                std::lock_guard< std::mutex > lock( state->mutex );
-+                if( state->cancelled )
-+                {
-+                    state->done = true;
-+                    state->cv.notify_all();
-+                    return;
-+                }
-+                state->started = true;
-+            }
-+
-+            try
-+            {
-+                func( c );
-+            }
-+            catch( ... )
-+            {
-+                finish_invocation( state, std::current_exception() );
-+                return;
-+            }
-+            finish_invocation( state );
-+        };
-+    }
-+
-+    template< class ExitCondition >
-+    void wait_for_invocation(
-+        std::shared_ptr< invocation_state > const & state,
-+        ExitCondition const & exit_condition )
-+    {
-+        std::unique_lock< std::mutex > lock( state->mutex );
-+        while( ! state->done )
-+        {
-+            if( ( _was_stopped || exit_condition() ) && ! state->started )
-+            {
-+                state->cancelled = true;
-+                return;
-+            }
-+            state->cv.wait_for( lock, std::chrono::milliseconds( 10 ) );
-+        }
-+    }
-+
-+    static void rethrow_invocation_error( std::shared_ptr< invocation_state > const & state )
-+    {
-+        std::exception_ptr error;
-+        {
-+            std::lock_guard< std::mutex > lock( state->mutex );
-+            error = state->error;
-+        }
-+        if( error )
-+            std::rethrow_exception( error );
-+    }
-+
-+public:
-+
-     // Certain conditions (see invoke()) may cause actions to be lost, e.g. when the queue gets full
-     // and we're non-blocking. The on_drop_callback allows caputring of these instances, if we
-     // want...
-@@ -329,15 +412,16 @@ public:
-     // in line (the oldest) for dispatch!
-     //
-     template<class T>
--    void invoke(T item, bool is_blocking = false)
-+    bool invoke(T item, bool is_blocking = false)
-     {
-         if (!_was_stopped)
-         {
-             if(is_blocking)
--                _queue.blocking_enqueue(std::move(item));
-+                return _queue.blocking_enqueue(std::move(item));
-             else
--                _queue.enqueue(std::move(item));
-+                return _queue.enqueue(std::move(item));
-         }
-+        return false;
-     }
-
-     // Like above, but synchronous: will return only when the action has actually been dispatched.
-@@ -345,22 +429,16 @@ public:
-     template<class T>
-     void invoke_and_wait(T item, std::function<bool()> exit_condition, bool is_blocking = false)
-     {
--        bool done = false;
--
--        //action
--        auto func = std::move(item);
--        invoke([&, func](dispatcher::cancellable_timer c)
--        {
--            std::lock_guard<std::mutex> lk(_blocking_invoke_mutex);
--            func(c);
-+        if( exit_condition() )
-+            return;
-
--            done = true;
--            _blocking_invoke_cv.notify_one();
--        }, is_blocking);
-+        auto state = std::make_shared< invocation_state >();
-+        auto queued = invoke( make_invocation_action( state, std::move( item ) ), is_blocking );
-
--        //wait
--        std::unique_lock<std::mutex> lk(_blocking_invoke_mutex);
--        _blocking_invoke_cv.wait(lk, [&](){ return done || exit_condition(); });
-+        if( ! queued )
-+            return;
-+        wait_for_invocation( state, exit_condition );
-+        rethrow_invocation_error( state );
-     }
-
-     // Stops the dispatcher. This is not a pause: it will clear out the queue, losing any pending
-@@ -396,9 +474,6 @@ private:
-
-     std::mutex _dispatch_mutex;
-
--    std::condition_variable _blocking_invoke_cv;
--    std::mutex _blocking_invoke_mutex;
--
-     std::atomic<bool> _is_alive;
- };
-
 diff --git a/src/libusb/darwin-capture-wait.h b/src/libusb/darwin-capture-wait.h
 new file mode 100644
+index 000000000..4d58ca85a
 --- /dev/null
 +++ b/src/libusb/darwin-capture-wait.h
 @@ -0,0 +1,30 @@
@@ -596,57 +165,9 @@ new file mode 100644
 +}
 +
 +#endif
-diff --git a/src/libusb/darwin-device-capture.h b/src/libusb/darwin-device-capture.h
-new file mode 100644
---- /dev/null
-+++ b/src/libusb/darwin-device-capture.h
-@@ -0,0 +1,44 @@
-+// License: Apache 2.0. See LICENSE file in root directory.
-+// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
-+
-+#pragma once
-+
-+#if defined(__APPLE__)
-+
-+#include "context-libusb.h"
-+#include "libusb.h"
-+
-+#include <memory>
-+#include <string>
-+
-+namespace librealsense
-+{
-+    namespace platform
-+    {
-+        class darwin_device_capture_state;
-+        class darwin_device_capture_registry;
-+
-+        class darwin_device_capture
-+        {
-+        public:
-+            static std::shared_ptr<darwin_device_capture> acquire(
-+                const std::shared_ptr<usb_context>& context,
-+                libusb_device* device,
-+                uint8_t interface_number);
-+
-+            ~darwin_device_capture();
-+
-+        private:
-+            darwin_device_capture(
-+                std::shared_ptr<darwin_device_capture_registry> registry,
-+                std::string key,
-+                std::shared_ptr<darwin_device_capture_state> state);
-+
-+            std::shared_ptr<darwin_device_capture_registry> _registry;
-+            std::string _key;
-+            std::shared_ptr<darwin_device_capture_state> _state;
-+        };
-+    }
-+}
-+
-+#endif
 diff --git a/src/libusb/darwin-device-capture.cpp b/src/libusb/darwin-device-capture.cpp
 new file mode 100644
+index 000000000..328af8cd4
 --- /dev/null
 +++ b/src/libusb/darwin-device-capture.cpp
 @@ -0,0 +1,316 @@
@@ -966,3 +487,371 @@ new file mode 100644
 +}
 +
 +#endif
+diff --git a/src/libusb/darwin-device-capture.h b/src/libusb/darwin-device-capture.h
+new file mode 100644
+index 000000000..e17648739
+--- /dev/null
++++ b/src/libusb/darwin-device-capture.h
+@@ -0,0 +1,44 @@
++// License: Apache 2.0. See LICENSE file in root directory.
++// Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
++
++#pragma once
++
++#if defined(__APPLE__)
++
++#include "context-libusb.h"
++#include "libusb.h"
++
++#include <memory>
++#include <string>
++
++namespace librealsense
++{
++    namespace platform
++    {
++        class darwin_device_capture_state;
++        class darwin_device_capture_registry;
++
++        class darwin_device_capture
++        {
++        public:
++            static std::shared_ptr<darwin_device_capture> acquire(
++                const std::shared_ptr<usb_context>& context,
++                libusb_device* device,
++                uint8_t interface_number);
++
++            ~darwin_device_capture();
++
++        private:
++            darwin_device_capture(
++                std::shared_ptr<darwin_device_capture_registry> registry,
++                std::string key,
++                std::shared_ptr<darwin_device_capture_state> state);
++
++            std::shared_ptr<darwin_device_capture_registry> _registry;
++            std::string _key;
++            std::shared_ptr<darwin_device_capture_state> _state;
++        };
++    }
++}
++
++#endif
+diff --git a/src/libusb/device-libusb.cpp b/src/libusb/device-libusb.cpp
+index dc5528754..b4f423b53 100644
+--- a/src/libusb/device-libusb.cpp
++++ b/src/libusb/device-libusb.cpp
+@@ -13,0 +14,3 @@ namespace librealsense
++#if defined(__APPLE__)
++                , _capture(darwin_device_capture::acquire(context, device, info.mi))
++#endif
+@@ -41 +44 @@ namespace librealsense
+-                            if(inf.altsetting->bInterfaceSubClass == RS2_USB_SUBCLASS_VIDEO_STREAMING)
++                            if(inf.altsetting->bInterfaceSubClass == RS2_USB_SUBCLASS_VIDEO_STREAMING && curr_ctrl_intf)
+diff --git a/src/libusb/device-libusb.h b/src/libusb/device-libusb.h
+index 607a7c79d..0bb70c9e3 100644
+--- a/src/libusb/device-libusb.h
++++ b/src/libusb/device-libusb.h
+@@ -7,0 +8,4 @@
++#if defined(__APPLE__)
++#include "darwin-device-capture.h"
++#endif
++
+@@ -31,0 +36,3 @@ namespace librealsense
++#if defined(__APPLE__)
++            std::shared_ptr<darwin_device_capture> _capture;
++#endif
+diff --git a/src/libusb/handle-libusb.h b/src/libusb/handle-libusb.h
+index f9e6069fc..3bc8471b4 100644
+--- a/src/libusb/handle-libusb.h
++++ b/src/libusb/handle-libusb.h
+@@ -45 +45,2 @@ namespace librealsense
+-                    _first_interface(interface), _context(context), _handle(nullptr)
++                    _first_interface(interface), _context(context), _handle(nullptr),
++                    _event_handler_started(false)
+@@ -57,2 +58 @@ namespace librealsense
+-                sts = libusb_set_auto_detach_kernel_driver(_handle, true); // detach from kernel driver when claimed and re-attach when released.
+-                if(sts != LIBUSB_SUCCESS)
++                try
+@@ -60,6 +60,15 @@ namespace librealsense
+-                    auto rs_sts =  libusb_status_to_rs(sts);
+-                    std::stringstream msg;
+-                    msg << "failed to set kernel driver auto detach: " << (int)interface->get_number() << ", error: " << usb_status_to_string.at(rs_sts);
+-                    LOG_ERROR(msg.str());
+-                    throw std::runtime_error(msg.str());
+-                }
++#if defined(__APPLE__)
++                    sts = libusb_set_auto_detach_kernel_driver(_handle, false);
++#else
++                    sts = libusb_set_auto_detach_kernel_driver(_handle, true);
++#endif
++                    if(sts != LIBUSB_SUCCESS)
++                    {
++                        auto rs_sts = libusb_status_to_rs(sts);
++                        std::stringstream msg;
++                        msg << "failed to configure kernel driver detach for interface: "
++                            << (int)interface->get_number() << ", error: "
++                            << usb_status_to_string.at(rs_sts);
++                        LOG_ERROR(msg.str());
++                        throw std::runtime_error(msg.str());
++                    }
+@@ -67,3 +76,3 @@ namespace librealsense
+-                claim_interface_or_throw(interface->get_number());
+-                for(auto&& i : interface->get_associated_interfaces())
+-                    claim_interface_or_throw(i->get_number());
++                    claim_interface_or_throw(interface->get_number());
++                    for(auto&& i : interface->get_associated_interfaces())
++                        claim_interface_or_throw(i->get_number());
+@@ -71 +80,8 @@ namespace librealsense
+-                _context->start_event_handler();
++                    _context->start_event_handler();
++                    _event_handler_started = true;
++                }
++                catch(...)
++                {
++                    cleanup();
++                    throw;
++                }
+@@ -76,5 +92,3 @@ namespace librealsense
+-                _context->stop_event_handler();
+-                for(auto&& i : _first_interface->get_associated_interfaces())
+-                    libusb_release_interface(_handle, i->get_number());
+-                libusb_release_interface(_handle, _first_interface->get_number());
+-                libusb_close(_handle);
++                if(_event_handler_started)
++                    _context->stop_event_handler();
++                cleanup();
+@@ -93,0 +108,14 @@ namespace librealsense
++                _claimed_interfaces.push_back(interface);
++            }
++
++            void cleanup() noexcept
++            {
++                if(!_handle)
++                    return;
++
++                for(auto it = _claimed_interfaces.rbegin(); it != _claimed_interfaces.rend(); ++it)
++                    libusb_release_interface(_handle, *it);
++                _claimed_interfaces.clear();
++
++                libusb_close(_handle);
++                _handle = nullptr;
+@@ -136,0 +165,2 @@ namespace librealsense
++            bool _event_handler_started;
++            std::vector<uint8_t> _claimed_interfaces;
+diff --git a/src/uvc/uvc-device.cpp b/src/uvc/uvc-device.cpp
+index 188a889b1..1863190a3 100644
+--- a/src/uvc/uvc-device.cpp
++++ b/src/uvc/uvc-device.cpp
+@@ -200 +200 @@ namespace librealsense
+-            }, [this, state](){ return state == _power_state; });
++            }, [this, state](){ return state == _power_state; }, true);
+@@ -425 +424,0 @@ namespace librealsense
+-
+@@ -426,0 +426 @@ namespace librealsense
++            uint8_t interface_number;
+@@ -437,0 +438 @@ namespace librealsense
++                        interface_number = f.interfaceNumber;
+@@ -445,0 +447,6 @@ namespace librealsense
++            auto inf = _usb_device->get_interface(interface_number);
++            if (inf == nullptr)
++                throw std::runtime_error("can't find UVC streaming interface of device: " + _usb_device->get_info().id);
++            auto _read_endpoint = inf->first_endpoint(platform::RS2_USB_ENDPOINT_DIRECTION_READ);
++            _messenger->reset_endpoint(_read_endpoint, 5000);
++
+@@ -491,2 +498,2 @@ namespace librealsense
+-            usb_status sts;
+-            uint32_t transferred;
++            usb_status sts = RS2_USB_STATUS_OTHER;
++            uint32_t transferred = 0;
+@@ -508 +515 @@ namespace librealsense
+-            }, [this](){ return !_messenger; });
++            }, [this](){ return !_messenger; }, true);
+@@ -580,2 +587,2 @@ namespace librealsense
+-            usb_status sts;
+-            uint32_t transferred;
++            usb_status sts = RS2_USB_STATUS_OTHER;
++            uint32_t transferred = 0;
+@@ -598 +605 @@ namespace librealsense
+-            }, [this](){ return !_messenger; });
++            }, [this](){ return !_messenger; }, true);
+@@ -609 +616 @@ namespace librealsense
+-            usb_status sts;
++            usb_status sts = RS2_USB_STATUS_OTHER;
+@@ -622 +629 @@ namespace librealsense
+-            }, [this](){ return !_messenger; });
++            }, [this](){ return !_messenger; }, true);
+@@ -632 +639 @@ namespace librealsense
+-            usb_status sts;
++            usb_status sts = RS2_USB_STATUS_OTHER;
+@@ -645 +652 @@ namespace librealsense
+-            }, [this](){ return !_messenger; });
++            }, [this](){ return !_messenger; }, true);
+@@ -844 +851 @@ namespace librealsense
+-            usb_status sts;
++            usb_status sts = RS2_USB_STATUS_OTHER;
+@@ -860 +867 @@ namespace librealsense
+-            }, [this](){ return !_messenger; });
++            }, [this](){ return !_messenger; }, true);
+diff --git a/src/uvc/uvc-streamer.cpp b/src/uvc/uvc-streamer.cpp
+index 678acbc3a..5df9a6863 100644
+--- a/src/uvc/uvc-streamer.cpp
++++ b/src/uvc/uvc-streamer.cpp
+@@ -174 +174 @@ namespace librealsense
+-            }, [this](){ return _running; });
++            }, [this](){ return _running; }, true);
+@@ -209 +209 @@ namespace librealsense
+-            }, [this](){ return !_running; });
++            }, [this](){ return !_running; }, true);
+diff --git a/third-party/rsutils/include/rsutils/concurrency/concurrency.h b/third-party/rsutils/include/rsutils/concurrency/concurrency.h
+index e74f1c3d5..fb5cb48bd 100644
+--- a/third-party/rsutils/include/rsutils/concurrency/concurrency.h
++++ b/third-party/rsutils/include/rsutils/concurrency/concurrency.h
+@@ -10,0 +11 @@
++#include <memory>
+@@ -11,0 +13 @@
++#include <exception>
+@@ -312,0 +315,81 @@ public:
++private:
++    struct invocation_state
++    {
++        std::mutex mutex;
++        std::condition_variable cv;
++        bool started = false;
++        bool done = false;
++        bool cancelled = false;
++        std::exception_ptr error;
++    };
++
++    static void finish_invocation(
++        std::shared_ptr< invocation_state > const & state,
++        std::exception_ptr error = nullptr )
++    {
++        {
++            std::lock_guard< std::mutex > lock( state->mutex );
++            state->error = std::move( error );
++            state->done = true;
++        }
++        state->cv.notify_all();
++    }
++
++    template< class T >
++    static action make_invocation_action( std::shared_ptr< invocation_state > state, T func )
++    {
++        return [state, func = std::move( func )]( cancellable_timer const & c ) mutable {
++            {
++                std::lock_guard< std::mutex > lock( state->mutex );
++                if( state->cancelled )
++                {
++                    state->done = true;
++                    state->cv.notify_all();
++                    return;
++                }
++                state->started = true;
++            }
++
++            try
++            {
++                func( c );
++            }
++            catch( ... )
++            {
++                finish_invocation( state, std::current_exception() );
++                return;
++            }
++            finish_invocation( state );
++        };
++    }
++
++    template< class ExitCondition >
++    void wait_for_invocation(
++        std::shared_ptr< invocation_state > const & state,
++        ExitCondition const & exit_condition )
++    {
++        std::unique_lock< std::mutex > lock( state->mutex );
++        while( ! state->done )
++        {
++            if( ( _was_stopped || exit_condition() ) && ! state->started )
++            {
++                state->cancelled = true;
++                return;
++            }
++            state->cv.wait_for( lock, std::chrono::milliseconds( 10 ) );
++        }
++    }
++
++    static void rethrow_invocation_error( std::shared_ptr< invocation_state > const & state )
++    {
++        std::exception_ptr error;
++        {
++            std::lock_guard< std::mutex > lock( state->mutex );
++            error = state->error;
++        }
++        if( error )
++            std::rethrow_exception( error );
++    }
++
++public:
++
+@@ -332 +415 @@ public:
+-    void invoke(T item, bool is_blocking = false)
++    bool invoke(T item, bool is_blocking = false)
+@@ -337 +420 @@ public:
+-                _queue.blocking_enqueue(std::move(item));
++                return _queue.blocking_enqueue(std::move(item));
+@@ -339 +422 @@ public:
+-                _queue.enqueue(std::move(item));
++                return _queue.enqueue(std::move(item));
+@@ -340,0 +424 @@ public:
++        return false;
+@@ -346 +430 @@ public:
+-    void invoke_and_wait(T item, std::function<bool()> exit_condition, bool is_blocking = false)
++    void invoke_and_wait(T item, std::function<bool()> exit_condition, bool is_blocking = true)
+@@ -348 +432,2 @@ public:
+-        bool done = false;
++        if( exit_condition() )
++            return;
+@@ -350,10 +435,2 @@ public:
+-        //action
+-        auto func = std::move(item);
+-        invoke([&, func](dispatcher::cancellable_timer c)
+-        {
+-            std::lock_guard<std::mutex> lk(_blocking_invoke_mutex);
+-            func(c);
+-
+-            done = true;
+-            _blocking_invoke_cv.notify_one();
+-        }, is_blocking);
++        auto state = std::make_shared< invocation_state >();
++        auto queued = invoke( make_invocation_action( state, std::move( item ) ), is_blocking );
+@@ -361,3 +438,4 @@ public:
+-        //wait
+-        std::unique_lock<std::mutex> lk(_blocking_invoke_mutex);
+-        _blocking_invoke_cv.wait(lk, [&](){ return done || exit_condition(); });
++        if( ! queued )
++            return;
++        wait_for_invocation( state, exit_condition );
++        rethrow_invocation_error( state );
+@@ -399,3 +476,0 @@ private:
+-    std::condition_variable _blocking_invoke_cv;
+-    std::mutex _blocking_invoke_mutex;
+-
+diff --git a/wrappers/python/CMakeLists.txt b/wrappers/python/CMakeLists.txt
+index 8354f84ca..7f26789ce 100644
+--- a/wrappers/python/CMakeLists.txt
++++ b/wrappers/python/CMakeLists.txt
+@@ -128,0 +129 @@ endif()
++if(BUILD_LEGACY_PYBACKEND)
+@@ -165,0 +167,10 @@ install(TARGETS pybackend2 pyrealsense2
++target_include_directories(pybackend2 PRIVATE ../../src)
++else()
++install(TARGETS pyrealsense2
++    EXPORT pyrealsense2Targets
++    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
++    LIBRARY DESTINATION ${PYTHON_INSTALL_DIR}
++    ARCHIVE DESTINATION ${PYTHON_INSTALL_DIR}
++)
++endif()
++
+@@ -179 +189,0 @@ install(FILES "${CMAKE_BINARY_DIR}/wrappers/python/pyrealsense2ConfigVersion.cma
+-target_include_directories(pybackend2 PRIVATE ../../src)

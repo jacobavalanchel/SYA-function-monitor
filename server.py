@@ -563,6 +563,14 @@ class RealSenseAdapter:
         except Exception:
             return 0
 
+    def _validate_frame_bytes(self, label, data, width, height, bytes_per_pixel):
+        expected = width * height * bytes_per_pixel
+        if width <= 0 or height <= 0 or len(data) != expected:
+            raise RuntimeError(
+                f"RealSense {label} frame is malformed: expected {expected} bytes for "
+                f"{width}x{height}, received {len(data)}."
+            )
+
     def _publish_attention(self, record):
         if record:
             EVENT_BROKER.publish("attention.status", record)
@@ -594,10 +602,18 @@ class RealSenseAdapter:
                 color_height = color_frame.get_height() if color_frame else 0
                 depth_width = depth_frame.get_width() if depth_frame else 0
                 depth_height = depth_frame.get_height() if depth_frame else 0
+                if color_bytes is not None:
+                    self._validate_frame_bytes("color", color_bytes, color_width, color_height, 3)
+                if depth_bytes is not None:
+                    self._validate_frame_bytes("depth", depth_bytes, depth_width, depth_height, 2)
 
                 with self.lock:
                     attention = self.latest_attention
-                    face_detected = CAMERA_STATE.get("faceDetected", False)
+                    face_detected = (
+                        CAMERA_STATE.get("faceDetected", False)
+                        if self.focus_detector is not None
+                        else False
+                    )
                 attention_changed = False
                 focus_interval = 1.0 / max(1, self.stream_config.get("focusFps", 2))
                 if (
@@ -681,13 +697,14 @@ class RealSenseAdapter:
                 if public_frame is not None:
                     EVENT_BROKER.publish("realsense.frame", public_frame)
         except Exception as error:
+            error_message = str(error)
             stop_event.set()
             try:
                 pipeline.stop()
             except Exception:
                 pass
             with self.lock:
-                self.last_error = str(error)
+                self.last_error = error_message
                 if self.pipeline is pipeline:
                     detector = self.focus_detector
                     self.pipeline = None
@@ -714,7 +731,7 @@ class RealSenseAdapter:
                 "state": "unknown",
                 "confidence": None,
                 "source": "realsense-runtime",
-                "reason": self.last_error,
+                "reason": error_message,
                 "modelVersion": "runtime-1",
             }
             with self.lock:
@@ -759,6 +776,7 @@ class RealSenseAdapter:
 
         pipeline = rs.pipeline()
         config = rs.config()
+        detector = None
 
         if config_values["serial"]:
             config.enable_device(config_values["serial"])
@@ -841,6 +859,7 @@ class RealSenseAdapter:
                 CAMERA_STATE["source"] = "realsense"
                 CAMERA_STATE["isActive"] = True
                 CAMERA_STATE["windowCreated"] = False
+                CAMERA_STATE["faceDetected"] = False
                 CAMERA_STATE["storagePath"] = self._records_dir()
             worker.start()
             return self.status()
@@ -849,9 +868,17 @@ class RealSenseAdapter:
                 pipeline.stop()
             except Exception:
                 pass
+            if detector:
+                try:
+                    detector.close()
+                except Exception:
+                    pass
             with self.lock:
                 self.pipeline = None
                 self.profile = None
+                self.worker = None
+                self.focus_detector = None
+                self.depth_scale = None
                 self.active = False
                 self.last_error = self._inaccessible_usb_message() or str(error)
             raise RuntimeError(self.last_error) from error
@@ -873,7 +900,9 @@ class RealSenseAdapter:
         if worker and worker is not threading.current_thread():
             worker.join(timeout=6)
             if worker.is_alive():
-                self.last_error = "Timed out while stopping the RealSense acquisition worker."
+                with self.lock:
+                    self.last_error = "Timed out while stopping the RealSense acquisition worker."
+                return self.status()
         if detector:
             try:
                 detector.close()

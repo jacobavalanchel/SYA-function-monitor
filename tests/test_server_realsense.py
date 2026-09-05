@@ -74,6 +74,31 @@ class BrokenPipeline:
         self.stopped = True
 
 
+class MalformedColorFrameSet(FakeFrameSet):
+    def __init__(self):
+        super().__init__()
+        self.color = FakeFrame(bytes([255, 0]), 2, 1, 42)
+
+
+class StuckWorker:
+    def join(self, timeout):
+        self.timeout = timeout
+
+    def is_alive(self):
+        return True
+
+
+class FakeDetector:
+    def __init__(self):
+        self.closed = False
+        self.error = ""
+        self.available = True
+        self.model_version = "fake-model"
+
+    def close(self):
+        self.closed = True
+
+
 class RealSenseAdapterTests(unittest.TestCase):
     def setUp(self):
         server.CAMERA_STATE.update(server.default_camera_status())
@@ -183,6 +208,22 @@ class RealSenseAdapterTests(unittest.TestCase):
         self.assertEqual(event["payload"]["state"], "unknown")
         self.assertIn("device disconnected", event["payload"]["reason"])
 
+    def test_malformed_frame_fails_closed_and_reports_unknown(self):
+        adapter = server.RealSenseAdapter()
+        pipeline = OneFramePipeline(adapter, MalformedColorFrameSet())
+        adapter.pipeline = pipeline
+        adapter.active = True
+        subscriber = server.EVENT_BROKER.subscribe()
+        try:
+            adapter._stream_loop(pipeline, adapter.stop_event)
+            event = subscriber.get(timeout=1)
+        finally:
+            server.EVENT_BROKER.unsubscribe(subscriber)
+        self.assertFalse(adapter.active)
+        self.assertIsNone(adapter.latest_raw_frame)
+        self.assertIn("malformed", adapter.last_error)
+        self.assertEqual(event["payload"]["state"], "unknown")
+
     def test_stop_clears_stale_frames(self):
         adapter = server.RealSenseAdapter()
         adapter.active = True
@@ -192,6 +233,22 @@ class RealSenseAdapterTests(unittest.TestCase):
         adapter.stop()
         self.assertIsNone(adapter.latest_frame())
         self.assertIsNone(adapter.latest_raw_frame)
+
+    def test_stop_timeout_preserves_resources_for_retry(self):
+        adapter = server.RealSenseAdapter()
+        pipeline = BrokenPipeline()
+        worker = StuckWorker()
+        detector = FakeDetector()
+        adapter.pipeline = pipeline
+        adapter.worker = worker
+        adapter.focus_detector = detector
+        adapter.active = True
+        adapter.import_error = "SDK unavailable for test"
+        status = adapter.stop()
+        self.assertTrue(status["active"])
+        self.assertIs(adapter.pipeline, pipeline)
+        self.assertFalse(detector.closed)
+        self.assertIn("Timed out", status["error"])
 
     def test_session_path_rejects_traversal(self):
         adapter = server.RealSenseAdapter()

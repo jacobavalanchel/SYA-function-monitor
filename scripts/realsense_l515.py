@@ -4,6 +4,7 @@
 import argparse
 import datetime
 import gc
+import hashlib
 import json
 import os
 import platform
@@ -11,7 +12,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 
@@ -20,6 +23,9 @@ SDK_COMMIT = "2dbaaf5964490cb02f811cf2ed38c8a893f5c027"
 SDK_REPOSITORY = "https://github.com/IntelRealSense/librealsense.git"
 L515_PRODUCT_ID = "0b64"
 SUPPORTED_FIRMWARE = "1.5.8.1"
+PATCH_SHA256 = "99007d67cc3cc92da737796e302dc6dc24f71be323c4e1a9f589112ed787faad"
+MIN_PYTHON = (3, 9)
+MAX_PYTHON = (3, 12)
 MODULE_ROOT = Path(__file__).resolve().parents[1]
 PATCH_PATH = MODULE_ROOT / "patches" / "librealsense-v2.54.2-macos-l515.patch"
 REQUIREMENTS_PATH = MODULE_ROOT / "requirements-realsense.txt"
@@ -45,6 +51,37 @@ def command_output(command):
         return run(command, capture=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return ""
+
+
+def normalize_product_id(value):
+    return str(value or "").strip().lower().removeprefix("0x").zfill(4)
+
+
+def is_l515(device):
+    return normalize_product_id(device.get("productId")) == L515_PRODUCT_ID
+
+
+def supported_python(version_info=None):
+    selected = version_info or sys.version_info
+    return MIN_PYTHON <= tuple(selected[:2]) < MAX_PYTHON
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def patch_sha256():
+    digest = hashlib.sha256()
+    with PATCH_PATH.open("rb") as patch_file:
+        for chunk in iter(lambda: patch_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def import_status(module_name):
@@ -163,6 +200,12 @@ def doctor_report():
     numpy_ok, numpy_version, numpy_detail = import_status("numpy")
     usb_devices = darwin_usb_devices()
     enumerated_devices, enumerate_error = sdk_devices() if py_ok else ([], py_detail)
+    l515_usb_devices = [device for device in usb_devices if is_l515(device)]
+    l515_sdk_devices = [device for device in enumerated_devices if is_l515(device)]
+    firmware_versions = {
+        str(device.get("firmwareVersion", "")) for device in l515_sdk_devices
+    }
+    firmware_supported = bool(l515_sdk_devices) and firmware_versions == {SUPPORTED_FIRMWARE}
     pkg_version = command_output(["pkg-config", "--modversion", "realsense2"])
     enumerate_version = ""
     enumerate_tool = shutil.which("rs-enumerate-devices")
@@ -177,13 +220,16 @@ def doctor_report():
         },
         {
             "id": "python",
-            "status": "pass" if sys.version_info >= (3, 9) else "fail",
-            "detail": f"{sys.executable} ({platform.python_version()})",
+            "status": "pass" if supported_python() else "fail",
+            "detail": (
+                f"{sys.executable} ({platform.python_version()}); supported range is "
+                f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}-{MAX_PYTHON[0]}.{MAX_PYTHON[1] - 1}"
+            ),
         },
         {
             "id": "librealsense-sdk",
             "status": "pass"
-            if py_ok and py_version == SDK_VERSION or SDK_VERSION in (pkg_version + enumerate_version)
+            if (py_ok and py_version == SDK_VERSION) or SDK_VERSION in (pkg_version + enumerate_version)
             else "warn",
             "detail": pkg_version or enumerate_version or py_version or "librealsense pkg-config/tool not found",
         },
@@ -208,19 +254,28 @@ def doctor_report():
         },
         {
             "id": "usb-device",
-            "status": "pass" if usb_devices or enumerated_devices else "warn",
-            "detail": usb_devices or enumerated_devices or "No Intel RealSense USB device detected",
+            "status": "pass" if l515_usb_devices or l515_sdk_devices else "warn",
+            "detail": l515_usb_devices or l515_sdk_devices or "No Intel RealSense L515 USB device detected",
         },
         {
             "id": "sdk-access",
-            "status": "pass" if enumerated_devices else "fail",
-            "detail": enumerated_devices or enumerate_error or "No SDK-accessible RealSense device",
+            "status": "pass" if l515_sdk_devices else "fail",
+            "detail": l515_sdk_devices or enumerate_error or "No SDK-accessible Intel RealSense L515",
+        },
+        {
+            "id": "firmware",
+            "status": "pass" if firmware_supported else "fail",
+            "detail": (
+                f"L515 firmware {SUPPORTED_FIRMWARE}"
+                if firmware_supported
+                else f"Expected L515 firmware {SUPPORTED_FIRMWARE}; detected {sorted(firmware_versions) or 'unavailable'}"
+            ),
         },
     ]
     privilege_required = bool(
         sys.platform == "darwin"
-        and usb_devices
-        and not enumerated_devices
+        and l515_usb_devices
+        and not l515_sdk_devices
         and ("access" in enumerate_error.lower() or "permission" in enumerate_error.lower())
     )
     return {
@@ -251,33 +306,85 @@ def print_report(report, as_json=False):
     print(report["next"])
 
 
+def git_tree(source, *, patched):
+    with tempfile.TemporaryDirectory(prefix="sya-l515-index-") as temporary:
+        index_path = Path(temporary) / "index"
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = str(index_path)
+        run(["git", "-C", source, "read-tree", SDK_COMMIT], env=env)
+        if patched:
+            run(
+                [
+                    "git",
+                    "-C",
+                    source,
+                    "apply",
+                    "--cached",
+                    "--unidiff-zero",
+                    "--whitespace=nowarn",
+                    PATCH_PATH,
+                ],
+                env=env,
+            )
+        else:
+            run(["git", "-C", source, "add", "-A", "--", "."], env=env)
+        return run(["git", "-C", source, "write-tree"], capture=True, env=env).stdout.strip()
+
+
 def ensure_clean_patched_source(source):
     commit = command_output(["git", "-C", source, "rev-parse", "HEAD"])
     if commit != SDK_COMMIT:
         raise RuntimeError(f"Expected librealsense {SDK_COMMIT}, found {commit or 'no Git checkout'}.")
     if not PATCH_PATH.exists():
         raise RuntimeError(f"Missing pinned patch: {PATCH_PATH}")
+    actual_patch_sha = patch_sha256()
+    if actual_patch_sha != PATCH_SHA256:
+        raise RuntimeError(
+            f"Pinned patch checksum mismatch: expected {PATCH_SHA256}, found {actual_patch_sha}."
+        )
+
+    clean_tree = command_output(["git", "-C", source, "rev-parse", f"{SDK_COMMIT}^{{tree}}"])
+    expected_tree = git_tree(source, patched=True)
+    actual_tree = git_tree(source, patched=False)
+    if actual_tree == expected_tree:
+        return "already-applied"
+    if actual_tree != clean_tree:
+        raise RuntimeError(
+            "The librealsense checkout has unrelated changes or a partial patch. Use a clean v2.54.2 checkout."
+        )
 
     forward = subprocess.run(
-        ["git", "-C", str(source), "apply", "--check", str(PATCH_PATH)],
+        [
+            "git",
+            "-C",
+            str(source),
+            "apply",
+            "--check",
+            "--unidiff-zero",
+            "--whitespace=nowarn",
+            str(PATCH_PATH),
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     if forward.returncode == 0:
-        run(["git", "-C", source, "apply", str(PATCH_PATH)])
+        run(
+            [
+                "git",
+                "-C",
+                source,
+                "apply",
+                "--unidiff-zero",
+                "--whitespace=nowarn",
+                PATCH_PATH,
+            ]
+        )
+        if git_tree(source, patched=False) != expected_tree:
+            raise RuntimeError("The librealsense source did not match the pinned patch after application.")
         return "applied"
-
-    reverse = subprocess.run(
-        ["git", "-C", str(source), "apply", "--reverse", "--check", str(PATCH_PATH)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if reverse.returncode == 0:
-        return "already-applied"
     raise RuntimeError(
-        "The librealsense checkout has unrelated changes or a partial patch. Use a clean v2.54.2 checkout."
+        f"Pinned librealsense patch cannot be applied: {forward.stderr.strip() or 'unknown error'}"
     )
 
 
@@ -286,25 +393,97 @@ def install_runtime(args):
         raise RuntimeError("The pinned L515 source patch installer currently supports macOS only.")
     if platform.machine() not in {"arm64", "x86_64"}:
         raise RuntimeError(f"Unsupported macOS architecture: {platform.machine()}")
+    if not supported_python():
+        raise RuntimeError(
+            "Run the installer with Python 3.9, 3.10, or 3.11; other versions are not supported."
+        )
     for command in ["git", "cmake", "brew"]:
         if not shutil.which(command):
             raise RuntimeError(f"Required command not found: {command}")
+    if not REQUIREMENTS_PATH.is_file():
+        raise RuntimeError(f"Missing pinned dependency file: {REQUIREMENTS_PATH}")
+    if not PATCH_PATH.is_file() or patch_sha256() != PATCH_SHA256:
+        raise RuntimeError("The pinned librealsense patch is missing or its checksum does not match.")
 
     root = Path(args.root).expanduser().resolve()
     venv = Path(args.venv).expanduser().resolve()
     source = Path(args.source).expanduser().resolve() if args.source else root / "src" / "librealsense"
-    build = root / "build" / f"macos-{platform.machine()}-python{sys.version_info.major}.{sys.version_info.minor}"
-    prefix = root / "sdk"
+    if root in {Path("/"), Path.home()}:
+        raise RuntimeError("Refusing to use a filesystem root or the home directory as the install root.")
+
+    libusb_prefix = Path(command_output(["brew", "--prefix", "libusb"]))
+    libusb_library = libusb_prefix / "lib" / "libusb-1.0.dylib"
+    libusb_headers = libusb_prefix / "include" / "libusb-1.0"
+    if not libusb_library.is_file() or not libusb_headers.is_dir():
+        raise RuntimeError("Homebrew libusb is missing. Install it with: brew install libusb")
+
     root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".install.lock"
+    try:
+        lock_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError(f"Another RealSense installation is active: {lock_path}") from error
+    try:
+        os.write(lock_descriptor, f"pid={os.getpid()}\n".encode("ascii"))
+        _install_runtime(args, root, venv, source, libusb_prefix)
+    finally:
+        os.close(lock_descriptor)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _install_runtime(args, root, venv, source, libusb_prefix):
+    prefix = root / "sdk"
     source.parent.mkdir(parents=True, exist_ok=True)
 
     if not source.exists():
-        run(["git", "clone", "--branch", f"v{SDK_VERSION}", "--depth", "1", SDK_REPOSITORY, source])
+        clone_path = source.with_name(f".{source.name}.clone-{uuid.uuid4().hex[:8]}")
+        try:
+            run(
+                [
+                    "git",
+                    "clone",
+                    "--branch",
+                    f"v{SDK_VERSION}",
+                    "--depth",
+                    "1",
+                    SDK_REPOSITORY,
+                    clone_path,
+                ]
+            )
+            clone_path.replace(source)
+        except Exception:
+            shutil.rmtree(clone_path, ignore_errors=True)
+            raise
     patch_state = ensure_clean_patched_source(source)
 
+    venv.parent.mkdir(parents=True, exist_ok=True)
     if not (venv / "bin" / "python3").exists():
         run([sys.executable, "-m", "venv", venv])
     venv_python = venv / "bin" / "python3"
+    interpreter = json.loads(
+        run(
+            [
+                venv_python,
+                "-c",
+                "import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine()}))",
+            ],
+            capture=True,
+        ).stdout
+    )
+    if not supported_python(interpreter["version"]):
+        raise RuntimeError(
+            f"The target venv uses unsupported Python {'.'.join(map(str, interpreter['version']))}."
+        )
+    if interpreter["machine"] != platform.machine():
+        raise RuntimeError(
+            f"The target venv architecture is {interpreter['machine']}, expected {platform.machine()}."
+        )
+    build = root / "build" / (
+        f"macos-{platform.machine()}-python{interpreter['version'][0]}.{interpreter['version'][1]}"
+    )
     run([venv_python, "-m", "pip", "install", "--upgrade", "pip==26.0.1"])
     if args.skip_focus:
         run([venv_python, "-m", "pip", "install", "numpy==1.26.4", "Pillow==11.3.0"])
@@ -319,10 +498,8 @@ def install_runtime(args):
         ],
         capture=True,
     ).stdout.strip()
-    libusb_prefix = Path(command_output(["brew", "--prefix", "libusb"]))
-    if not libusb_prefix.exists():
-        raise RuntimeError("Homebrew libusb is missing. Install it with: brew install libusb")
-
+    if build.exists():
+        shutil.rmtree(build)
     build.mkdir(parents=True, exist_ok=True)
     rpath = f"{prefix / 'lib'};{libusb_prefix / 'lib'}"
     configure = [
@@ -346,6 +523,7 @@ def install_runtime(args):
         "-DBUILD_GLSL_EXTENSIONS=OFF",
         "-DBUILD_TOOLS=OFF",
         "-DBUILD_PYTHON_BINDINGS=ON",
+        "-DBUILD_LEGACY_PYBACKEND=OFF",
         f"-DPYTHON_EXECUTABLE={venv_python}",
         f"-DPYTHON_INSTALL_DIR={site_packages}",
         "-DBUILD_UNIT_TESTS=OFF",
@@ -367,7 +545,6 @@ def install_runtime(args):
             "Release",
             "--target",
             "pyrealsense2",
-            "pybackend2",
             "pyrsutils",
             "--parallel",
             str(args.jobs),
@@ -375,28 +552,46 @@ def install_runtime(args):
     )
     run(["cmake", "--install", build, "--config", "Release"])
 
-    verification = run(
+    verification = json.loads(run(
         [
             venv_python,
             "-c",
-            "import pyrealsense2 as rs; print(rs.__version__); print(rs.__file__)",
+            (
+                "import json, pathlib, pyrealsense2 as rs, pyrsutils, sysconfig; "
+                "print(json.dumps({'version': rs.__version__, 'pyrealsense2': rs.__file__, "
+                "'pyrsutils': pyrsutils.__file__, 'sitePackages': sysconfig.get_paths()['platlib']}))"
+            ),
         ],
         capture=True,
-    ).stdout.strip().splitlines()
-    if not verification or verification[0] != SDK_VERSION:
+    ).stdout)
+    if verification.get("version") != SDK_VERSION:
         raise RuntimeError(f"Installed pyrealsense2 verification failed: {verification}")
+    site_packages_path = Path(verification["sitePackages"]).resolve()
+    for module_name in ["pyrealsense2", "pyrsutils"]:
+        module_path = Path(verification[module_name]).resolve()
+        if site_packages_path not in module_path.parents:
+            raise RuntimeError(f"{module_name} loaded outside the target venv: {module_path}")
+    for stale_backend in site_packages_path.glob("pybackend2*"):
+        if stale_backend.is_dir() and not stale_backend.is_symlink():
+            shutil.rmtree(stale_backend)
+        else:
+            stale_backend.unlink()
+
+    installed_packages = run([venv_python, "-m", "pip", "freeze", "--all"], capture=True).stdout.splitlines()
 
     state = {
         "installedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "sdkVersion": SDK_VERSION,
         "sdkCommit": SDK_COMMIT,
         "patch": str(PATCH_PATH),
+        "patchSha256": PATCH_SHA256,
         "patchState": patch_state,
         "architecture": platform.machine(),
         "python": str(venv_python),
-        "pythonVersion": platform.python_version(),
-        "module": verification[1] if len(verification) > 1 else "",
+        "pythonVersion": ".".join(map(str, interpreter["version"])),
+        "module": verification["pyrealsense2"],
         "prefix": str(prefix),
+        "packages": installed_packages,
         "firmwareOperationsIncluded": False,
     }
     state_path = root / "install.json"
@@ -413,28 +608,42 @@ def smoke(args):
     except Exception as error:
         raise RuntimeError(f"pyrealsense2 is unavailable: {error}") from error
 
-    pipeline = rs.pipeline()
-    config = rs.config()
-    if args.serial:
-        config.enable_device(args.serial)
-    enable_color = not args.depth_only
-    enable_depth = not args.color_only
-    if enable_color:
-        config.enable_stream(rs.stream.color, args.width, args.height, rs.format.rgb8, args.fps)
-    if enable_depth:
-        config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
-
+    pipeline = None
     started = False
     color_frames = 0
     depth_frames = 0
     first_frame_ms = None
     started_at = time.monotonic()
     try:
+        l515_devices = []
+        for device in list(rs.context().query_devices()):
+            product_id = device.get_info(rs.camera_info.product_id)
+            serial_number = device.get_info(rs.camera_info.serial_number)
+            if normalize_product_id(product_id) == L515_PRODUCT_ID:
+                l515_devices.append((device, serial_number))
+        if args.serial:
+            l515_devices = [entry for entry in l515_devices if entry[1] == args.serial]
+        if not l515_devices:
+            target = f" with serial {args.serial}" if args.serial else ""
+            raise RuntimeError(f"No SDK-accessible Intel RealSense L515{target} was detected.")
+
+        selected_serial = l515_devices[0][1]
+        pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_device(selected_serial)
+        enable_color = not args.depth_only
+        enable_depth = not args.color_only
+        if enable_color:
+            config.enable_stream(rs.stream.color, args.width, args.height, rs.format.rgb8, args.fps)
+        if enable_depth:
+            config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+
         profile = pipeline.start(config)
         started = True
         device = profile.get_device()
         serial = device.get_info(rs.camera_info.serial_number)
         firmware = device.get_info(rs.camera_info.firmware_version)
+        product_id = normalize_product_id(device.get_info(rs.camera_info.product_id))
         for _index in range(args.frames):
             frames = pipeline.wait_for_frames(args.timeout_ms)
             if frames.get_color_frame():
@@ -445,9 +654,13 @@ def smoke(args):
                 first_frame_ms = round((time.monotonic() - started_at) * 1000)
         result = {
             "ok": color_frames == (args.frames if enable_color else 0)
-            and depth_frames == (args.frames if enable_depth else 0),
+            and depth_frames == (args.frames if enable_depth else 0)
+            and product_id == L515_PRODUCT_ID
+            and firmware == SUPPORTED_FIRMWARE,
             "serialNumber": serial,
+            "productId": product_id,
             "firmwareVersion": firmware,
+            "firmwareSupported": firmware == SUPPORTED_FIRMWARE,
             "sdkVersion": rs.__version__,
             "requestedFrames": args.frames,
             "colorFrames": color_frames,
@@ -469,8 +682,11 @@ def smoke(args):
         }
     finally:
         if started:
-            pipeline.stop()
-        del pipeline
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+        pipeline = None
         gc.collect()
 
     print(json.dumps(result, indent=2) if args.json else result)
@@ -497,16 +713,16 @@ def build_parser():
     install_parser.add_argument("--root", default=str(DEFAULT_ROOT))
     install_parser.add_argument("--venv", default=str(DEFAULT_VENV))
     install_parser.add_argument("--source", help="Use a clean librealsense v2.54.2 checkout instead of cloning.")
-    install_parser.add_argument("--jobs", type=int, default=max(1, min(os.cpu_count() or 2, 8)))
+    install_parser.add_argument("--jobs", type=positive_int, default=max(1, min(os.cpu_count() or 2, 8)))
     install_parser.add_argument("--skip-focus", action="store_true", help="Install preview dependencies without MediaPipe.")
 
     smoke_parser = subparsers.add_parser("smoke", help="Acquire and release a bounded set of L515 frames.")
     smoke_parser.add_argument("--serial", default="")
-    smoke_parser.add_argument("--frames", type=int, default=30)
-    smoke_parser.add_argument("--width", type=int, default=640)
-    smoke_parser.add_argument("--height", type=int, default=480)
-    smoke_parser.add_argument("--fps", type=int, default=30)
-    smoke_parser.add_argument("--timeout-ms", type=int, default=5000)
+    smoke_parser.add_argument("--frames", type=positive_int, default=30)
+    smoke_parser.add_argument("--width", type=positive_int, default=640)
+    smoke_parser.add_argument("--height", type=positive_int, default=480)
+    smoke_parser.add_argument("--fps", type=positive_int, default=30)
+    smoke_parser.add_argument("--timeout-ms", type=positive_int, default=5000)
     stream_group = smoke_parser.add_mutually_exclusive_group()
     stream_group.add_argument("--depth-only", action="store_true")
     stream_group.add_argument("--color-only", action="store_true")

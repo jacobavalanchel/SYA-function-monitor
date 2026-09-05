@@ -1,4 +1,4 @@
-# Pinned local preview and focus-inference dependencies for Python 3.9+.
+# Pinned local preview and focus-inference dependencies for Python 3.9-3.11.
 numpy==1.26.4
 Pillow==11.3.0
 mediapipe==0.10.21
