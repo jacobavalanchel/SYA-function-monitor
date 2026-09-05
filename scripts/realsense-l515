@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+module_root="$(cd "$(dirname "$0")/.." && pwd)"
+venv_root="${MONITOR_REALSENSE_VENV:-$HOME/.sya/monitor/.venv}"
+
+if [ -x "$venv_root/bin/python3" ]; then
+  python_bin="$venv_root/bin/python3"
+else
+  python_bin="${PYTHON:-python3}"
+fi
+
+exec "$python_bin" "$module_root/scripts/realsense_l515.py" "$@"

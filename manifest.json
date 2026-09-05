@@ -1,6 +1,6 @@
 {
   "id": "monitor",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "runtime": "local-http",
   "entry": {
     "command": "bin/monitor-server",
@@ -25,6 +25,8 @@
     "action-discovery",
     "generic-invoke",
     "realsense-rgbd-source",
+    "live-camera-preview",
+    "focus-inference",
     "training-data-capture"
   ],
   "events": [
@@ -33,7 +35,8 @@
     "screen.status",
     "camera.status",
     "realsense.frame",
-    "realsense.training.sample"
+    "realsense.training.sample",
+    "attention.status"
   ],
   "permissions": ["screen", "camera", "storage"]
 }

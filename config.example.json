@@ -18,6 +18,11 @@
       "depthFps": 30,
       "enableColor": true,
       "enableDepth": true,
+      "previewEnabled": true,
+      "previewFps": 2,
+      "jpegQuality": 72,
+      "focusEnabled": true,
+      "focusFps": 2,
       "serial": "",
       "recordsDir": ""
     }

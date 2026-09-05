@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "SYA Monitor Function API",
-    "version": "0.1.3"
+    "version": "0.2.0"
   },
   "paths": {
     "/health": {
@@ -453,6 +453,25 @@
         }
       }
     },
+    "/api/monitor/realsense/frame/latest": {
+      "get": {
+        "operationId": "realsense.frame.latest",
+        "summary": "Read the latest RealSense preview frame",
+        "description": "Returns the latest bounded in-memory JPEG preview and focus result, or null before the first frame. No preview file is written to disk.",
+        "responses": {
+          "200": {
+            "description": "Latest RealSense preview frame",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RealSenseFrameResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/monitor/realsense/training/start": {
       "post": {
         "operationId": "realsense.training.start",
@@ -741,6 +760,34 @@
             "type": "boolean",
             "default": true
           },
+          "previewEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Emit a bounded in-memory JPEG preview without persisting every frame."
+          },
+          "previewFps": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "default": 2
+          },
+          "jpegQuality": {
+            "type": "integer",
+            "minimum": 40,
+            "maximum": 90,
+            "default": 72
+          },
+          "focusEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Run optional local MediaPipe face and iris direction inference."
+          },
+          "focusFps": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "default": 2
+          },
           "serial": {
             "type": "string",
             "description": "Optional RealSense serial number when multiple devices are connected."
@@ -806,6 +853,180 @@
             }
           }
         ]
+      },
+      "AttentionRecord": {
+        "type": "object",
+        "required": [
+          "id",
+          "timestamp",
+          "state",
+          "confidence",
+          "source",
+          "reason"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer",
+            "description": "Unix epoch milliseconds."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "focused",
+              "distracted",
+              "away",
+              "unknown"
+            ]
+          },
+          "confidence": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Null when the heuristic does not expose calibrated probability."
+          },
+          "source": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "modelVersion": {
+            "type": "string"
+          },
+          "directions": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "RealSenseFrame": {
+        "type": "object",
+        "required": [
+          "source",
+          "frameId",
+          "timestamp",
+          "capturedAt",
+          "frameNumber",
+          "width",
+          "height",
+          "mimeType",
+          "jpegBase64",
+          "depth",
+          "attention"
+        ],
+        "properties": {
+          "source": {
+            "const": "realsense"
+          },
+          "frameId": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer",
+            "description": "Unix epoch milliseconds."
+          },
+          "capturedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "frameNumber": {
+            "type": "integer"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mimeType": {
+            "const": "image/jpeg"
+          },
+          "jpegBase64": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "contentMediaType": "image/jpeg"
+          },
+          "deviceSerial": {
+            "type": "string"
+          },
+          "depth": {
+            "type": "object",
+            "required": [
+              "available",
+              "width",
+              "height",
+              "format",
+              "depthScaleMeters"
+            ],
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "width": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "height": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "format": {
+                "type": "string"
+              },
+              "depthScaleMeters": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          },
+          "attention": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AttentionRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "RealSenseFrameResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "data"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "data": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RealSenseFrame"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
       },
       "FunctionResponse": {
         "oneOf": [

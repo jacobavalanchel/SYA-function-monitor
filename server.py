@@ -5,12 +5,18 @@ import http.server
 import array
 import json
 import os
+import queue
+import re
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+
+from realsense_runtime import EventBroker, FocusEstimator, encode_rgb_jpeg, utc_timestamp
 
 STATIC_DIR = os.path.dirname(os.path.abspath(__file__))
 MODULE_ROOT = os.path.dirname(STATIC_DIR)
@@ -52,6 +58,12 @@ ACTION_DEFINITIONS = [
     {"action": "realsense.start", "method": "POST", "path": "/api/monitor/realsense/start", "description": "Start Intel RealSense streaming."},
     {"action": "realsense.stop", "method": "POST", "path": "/api/monitor/realsense/stop", "description": "Stop Intel RealSense streaming."},
     {"action": "realsense.capture", "method": "POST", "path": "/api/monitor/realsense/capture", "description": "Capture a RealSense RGB/depth sample for inference or training."},
+    {
+        "action": "realsense.frame.latest",
+        "method": "GET",
+        "path": "/api/monitor/realsense/frame/latest",
+        "description": "Read the latest in-memory RealSense color preview and focus result.",
+    },
     {
         "action": "realsense.training.start",
         "method": "POST",
@@ -125,6 +137,7 @@ SCREEN_STATE = default_screen_status()
 CAMERA_STATE = default_camera_status()
 CAMERA_STATE["source"] = "builtin"
 CAMERA_STATE["availableSources"] = ["builtin", "realsense"]
+EVENT_BROKER = EventBroker()
 
 
 class RealSenseAdapter:
@@ -139,6 +152,19 @@ class RealSenseAdapter:
         self.last_frame_time = None
         self.last_sample_path = ""
         self.last_error = ""
+        self.preview_error = ""
+        self.total_samples = 0
+        self.device_cache = []
+        self.device_serial = ""
+        self.depth_scale = None
+        self.latest_frame_data = None
+        self.latest_raw_frame = None
+        self.latest_attention = None
+        self.focus_detector = None
+        self.worker = None
+        self.stop_event = threading.Event()
+        self.lock = threading.RLock()
+        self.frame_condition = threading.Condition(self.lock)
         self.stream_config = {
             "width": 640,
             "height": 480,
@@ -151,6 +177,11 @@ class RealSenseAdapter:
             "depthFps": 30,
             "enableColor": True,
             "enableDepth": True,
+            "previewEnabled": True,
+            "previewFps": 2,
+            "jpegQuality": 72,
+            "focusEnabled": True,
+            "focusFps": 2,
             "serial": "",
         }
         self.training_session = None
@@ -213,7 +244,7 @@ class RealSenseAdapter:
     def _usb_realsense_devices(self):
         root = "/sys/bus/usb/devices"
         if not os.path.isdir(root):
-            return []
+            return self._darwin_usb_realsense_devices() if sys.platform == "darwin" else []
 
         devices = []
         for name in os.listdir(root):
@@ -239,6 +270,92 @@ class RealSenseAdapter:
             })
         return devices
 
+    def _darwin_usb_realsense_devices(self):
+        try:
+            result = subprocess.run(
+                ["system_profiler", "SPUSBDataType", "-json", "-detailLevel", "mini"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                return self._darwin_ioreg_realsense_devices()
+            report = json.loads(result.stdout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            return self._darwin_ioreg_realsense_devices()
+
+        devices = []
+
+        def visit(value):
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if not isinstance(value, dict):
+                return
+
+            name = str(value.get("_name", ""))
+            vendor_id = str(value.get("vendor_id", "")).lower()
+            product_id = str(value.get("product_id", "")).lower()
+            if "0x8086" in vendor_id and ("realsense" in name.lower() or "0x0b64" in product_id):
+                devices.append({
+                    "name": name or "Intel RealSense camera",
+                    "serialNumber": str(value.get("serial_num", "")),
+                    "productId": product_id.split()[0].replace("0x", ""),
+                    "physicalPort": str(value.get("location_id", "")),
+                    "usbType": str(value.get("speed", "")),
+                    "sdkAccessible": False,
+                })
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+
+        visit(report)
+        unique = {}
+        for device in devices:
+            key = device.get("serialNumber") or device.get("physicalPort") or device.get("name")
+            unique[key] = device
+        return list(unique.values()) or self._darwin_ioreg_realsense_devices()
+
+    def _darwin_ioreg_realsense_devices(self):
+        try:
+            result = subprocess.run(
+                ["ioreg", "-p", "IOUSB", "-c", "IOUSBHostDevice", "-r", "-l"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                return []
+        except (OSError, subprocess.SubprocessError):
+            return []
+
+        devices = []
+        blocks = re.split(r"(?m)(?=^\s*\+-o )", result.stdout)
+        for block in blocks:
+            if "realsense" not in block.lower():
+                continue
+            vendor_match = re.search(r'"idVendor"\s*=\s*(\d+)', block)
+            product_match = re.search(r'"idProduct"\s*=\s*(\d+)', block)
+            if not vendor_match or int(vendor_match.group(1)) != 0x8086:
+                continue
+            name_match = re.search(r"\+-o\s+(.+?)@", block)
+            serial_match = re.search(r'"USB Serial Number"\s*=\s*"([^"]*)"', block)
+            location_match = re.search(r'"locationID"\s*=\s*(\d+)', block)
+            speed_match = re.search(r'"UsbLinkSpeed"\s*=\s*(\d+)', block)
+            speed = int(speed_match.group(1)) if speed_match else 0
+            devices.append({
+                "name": name_match.group(1).strip() if name_match else "Intel RealSense camera",
+                "serialNumber": serial_match.group(1).lstrip("0") if serial_match else "",
+                "productId": f"{int(product_match.group(1)):04x}" if product_match else "",
+                "physicalPort": location_match.group(1) if location_match else "",
+                "usbType": f"{speed / 1_000_000_000:g} Gb/s" if speed else "",
+                "sdkAccessible": False,
+            })
+        return devices
+
     def _read_sysfs_value(self, path, filename):
         try:
             with open(os.path.join(path, filename), "r", encoding="utf-8") as handle:
@@ -251,12 +368,18 @@ class RealSenseAdapter:
         if not usb_devices:
             return ""
         if any(str(device.get("productId", "")).lower() == "0b64" for device in usb_devices):
+            if sys.platform == "darwin":
+                return (
+                    "Intel RealSense L515 is visible over USB, but librealsense cannot access its depth sensor. "
+                    "Run scripts/realsense-l515 doctor and smoke from Terminal; direct USB access on macOS "
+                    "may require elevated privileges."
+                )
             sdk_version = getattr(self.rs, "__version__", "") if self.rs is not None else ""
             version_tuple = self._version_tuple(sdk_version)
-            if version_tuple and version_tuple >= (2, 54, 1):
+            if version_tuple and version_tuple > (2, 54, 2):
                 return (
-                    f"Intel RealSense L515 is connected, but pyrealsense2 {sdk_version} does not enumerate it. "
-                    "Use a librealsense/pyrealsense2 build that still supports L515, such as pyrealsense2 2.53.1 on Python 3.10."
+                    f"Intel RealSense L515 is connected, but pyrealsense2 {sdk_version} no longer supports it. "
+                    "Install the pinned SYA librealsense/pyrealsense2 2.54.2 runtime."
                 )
         return (
             "Intel RealSense USB device is connected, but pyrealsense2 cannot enumerate it. "
@@ -280,48 +403,81 @@ class RealSenseAdapter:
             devices = []
             for device in self._query_devices():
                 devices.append(self._device_info(device))
-            self.last_error = ""
+            with self.lock:
+                self.device_cache = devices
+                self.last_error = ""
             return devices
         except Exception as error:
-            self.last_error = str(error)
+            with self.lock:
+                self.device_cache = []
+                self.last_error = self._inaccessible_usb_message() or str(error)
             return []
 
     def _records_dir(self):
         configured = load_realsense_config().get("recordsDir")
         if isinstance(configured, str) and configured.strip():
-            return configured.strip()
-        return os.environ.get("MONITOR_RECORDS_DIR", DEFAULT_RECORDS_DIR)
+            selected = configured.strip()
+        else:
+            selected = os.environ.get("MONITOR_RECORDS_DIR", DEFAULT_RECORDS_DIR)
+        return os.path.abspath(os.path.expanduser(selected))
 
     def status(self):
-        sdk_devices = self.list_devices() if not self.import_error else []
+        with self.lock:
+            active = self.active
+            cached_devices = list(self.device_cache)
+            latest_attention = dict(self.latest_attention) if self.latest_attention else None
+            preview_available = self.latest_frame_data is not None
+            detector = self.focus_detector
+        sdk_devices = cached_devices if active and cached_devices else (
+            self.list_devices() if not self.import_error else []
+        )
         usb_devices = [] if sdk_devices else self._usb_realsense_devices()
         error = self.last_error or self.import_error
         if not error and usb_devices:
             error = self._inaccessible_usb_message()
+        focus_enabled = bool(self.stream_config.get("focusEnabled", True))
+        focus_error = detector.error if detector is not None else ""
         return {
             "source": "realsense",
             "available": bool(self.rs and sdk_devices),
             "sdkLoaded": bool(self.rs),
-            "active": self.active,
+            "sdkVersion": getattr(self.rs, "__version__", "") if self.rs is not None else "",
+            "backend": "pyrealsense2",
+            "privilegeRequired": bool(sys.platform == "darwin" and usb_devices and not sdk_devices),
+            "active": active,
             "startedAt": self.started_at,
             "totalFrames": self.total_frames,
+            "totalSamples": self.total_samples,
             "lastFrameTime": self.last_frame_time,
             "lastSamplePath": self.last_sample_path,
             "recordsDir": self._records_dir(),
             "stream": self.stream_config,
             "devices": sdk_devices or usb_devices,
             "trainingSession": self.training_session,
+            "preview": {
+                "enabled": bool(self.stream_config.get("previewEnabled", True)),
+                "available": preview_available,
+                "fps": self.stream_config.get("previewFps", 2),
+                "error": self.preview_error,
+            },
+            "inference": {
+                "enabled": focus_enabled,
+                "available": bool(detector and detector.available),
+                "modelVersion": detector.model_version if detector else "",
+                "state": latest_attention.get("state") if latest_attention else "unknown",
+                "error": focus_error,
+            },
             "error": error,
         }
 
     def _read_stream_config(self, payload):
         config = dict(self.stream_config)
         configured_defaults = load_realsense_config()
-        for key in ["width", "height", "fps", "colorWidth", "colorHeight", "colorFps", "depthWidth", "depthHeight", "depthFps"]:
+        for key in ["width", "height", "fps", "colorWidth", "colorHeight", "colorFps", "depthWidth", "depthHeight", "depthFps", "previewFps", "jpegQuality", "focusFps"]:
             value = configured_defaults.get(key)
             if isinstance(value, int) and value > 0:
                 config[key] = value
-        for key in ["enableColor", "enableDepth"]:
+        for key in ["enableColor", "enableDepth", "previewEnabled", "focusEnabled"]:
             if isinstance(configured_defaults.get(key), bool):
                 config[key] = configured_defaults[key]
         serial = configured_defaults.get("serial")
@@ -329,12 +485,12 @@ class RealSenseAdapter:
             config["serial"] = serial.strip()
 
         if isinstance(payload, dict):
-            for key in ["width", "height", "fps", "colorWidth", "colorHeight", "colorFps", "depthWidth", "depthHeight", "depthFps"]:
+            for key in ["width", "height", "fps", "colorWidth", "colorHeight", "colorFps", "depthWidth", "depthHeight", "depthFps", "previewFps", "jpegQuality", "focusFps"]:
                 value = payload.get(key)
                 if isinstance(value, int) and value > 0:
                     config[key] = value
 
-            for key in ["enableColor", "enableDepth"]:
+            for key in ["enableColor", "enableDepth", "previewEnabled", "focusEnabled"]:
                 if isinstance(payload.get(key), bool):
                     config[key] = payload[key]
 
@@ -344,6 +500,12 @@ class RealSenseAdapter:
 
         if not config["enableColor"] and not config["enableDepth"]:
             raise ValueError("At least one RealSense stream must be enabled.")
+        if (config.get("previewEnabled") or config.get("focusEnabled")) and not config["enableColor"]:
+            raise ValueError("RealSense preview and focus inference require the color stream.")
+
+        config["previewFps"] = min(config.get("previewFps", 2), 5)
+        config["focusFps"] = min(config.get("focusFps", 2), 5)
+        config["jpegQuality"] = min(config.get("jpegQuality", 72), 90)
 
         for prefix in ["color", "depth"]:
             if config.get(f"{prefix}Width", 0) <= 0:
@@ -393,23 +555,207 @@ class RealSenseAdapter:
             ),
         )
 
+    def _frame_number(self, frame):
+        if not frame:
+            return 0
+        try:
+            return int(frame.get_frame_number())
+        except Exception:
+            return 0
+
+    def _publish_attention(self, record):
+        if record:
+            EVENT_BROKER.publish("attention.status", record)
+
+    def _stream_loop(self, pipeline, stop_event):
+        last_preview_at = float("-inf")
+        last_focus_at = float("-inf")
+        try:
+            while not stop_event.is_set():
+                try:
+                    frames = pipeline.wait_for_frames(1000)
+                except Exception as error:
+                    if stop_event.is_set():
+                        break
+                    raise RuntimeError(f"RealSense frame acquisition failed: {error}") from error
+
+                color_frame = frames.get_color_frame()
+                depth_frame = frames.get_depth_frame()
+                if not color_frame and not depth_frame:
+                    continue
+
+                now_monotonic = time.monotonic()
+                timestamp_ms = int(time.time() * 1000)
+                captured_at = utc_timestamp()
+                color_bytes = bytes(color_frame.get_data()) if color_frame else None
+                depth_bytes = bytes(depth_frame.get_data()) if depth_frame else None
+                frame_number = self._frame_number(color_frame or depth_frame)
+                color_width = color_frame.get_width() if color_frame else 0
+                color_height = color_frame.get_height() if color_frame else 0
+                depth_width = depth_frame.get_width() if depth_frame else 0
+                depth_height = depth_frame.get_height() if depth_frame else 0
+
+                with self.lock:
+                    attention = self.latest_attention
+                    face_detected = CAMERA_STATE.get("faceDetected", False)
+                attention_changed = False
+                focus_interval = 1.0 / max(1, self.stream_config.get("focusFps", 2))
+                if (
+                    color_bytes
+                    and self.focus_detector is not None
+                    and now_monotonic - last_focus_at >= focus_interval
+                ):
+                    attention, face_detected, attention_changed = self.focus_detector.analyze(
+                        color_bytes, color_width, color_height, timestamp_ms
+                    )
+                    last_focus_at = now_monotonic
+
+                jpeg_base64 = None
+                preview_interval = 1.0 / max(1, self.stream_config.get("previewFps", 2))
+                if (
+                    color_bytes
+                    and self.stream_config.get("previewEnabled", True)
+                    and now_monotonic - last_preview_at >= preview_interval
+                ):
+                    try:
+                        jpeg_base64 = encode_rgb_jpeg(
+                            color_bytes,
+                            color_width,
+                            color_height,
+                            self.stream_config.get("jpegQuality", 72),
+                        )
+                        self.preview_error = ""
+                    except Exception as error:
+                        self.preview_error = str(error)
+                    last_preview_at = now_monotonic
+
+                raw_frame = {
+                    "timestamp": timestamp_ms,
+                    "capturedAt": captured_at,
+                    "frameNumber": frame_number,
+                    "colorBytes": color_bytes,
+                    "colorWidth": color_width,
+                    "colorHeight": color_height,
+                    "depthBytes": depth_bytes,
+                    "depthWidth": depth_width,
+                    "depthHeight": depth_height,
+                }
+                public_frame = None
+                with self.frame_condition:
+                    if self.pipeline is not pipeline:
+                        break
+                    self.total_frames += 1
+                    self.last_frame_time = captured_at
+                    self.latest_raw_frame = raw_frame
+                    if attention is not None:
+                        self.latest_attention = attention
+                    if jpeg_base64 is not None:
+                        public_frame = {
+                            "source": "realsense",
+                            "frameId": f"frame-{timestamp_ms}-{frame_number}",
+                            "timestamp": timestamp_ms,
+                            "capturedAt": captured_at,
+                            "frameNumber": frame_number,
+                            "width": color_width,
+                            "height": color_height,
+                            "mimeType": "image/jpeg",
+                            "jpegBase64": jpeg_base64,
+                            "deviceSerial": self.device_serial,
+                            "depth": {
+                                "available": bool(depth_frame),
+                                "width": depth_width,
+                                "height": depth_height,
+                                "format": "z16" if depth_frame else "",
+                                "depthScaleMeters": self._depth_scale() if depth_frame else None,
+                            },
+                            "attention": attention,
+                        }
+                        self.latest_frame_data = public_frame
+                    CAMERA_STATE["totalFrames"] = self.total_frames
+                    CAMERA_STATE["lastFrameTime"] = timestamp_ms
+                    CAMERA_STATE["faceDetected"] = bool(face_detected)
+                    self.frame_condition.notify_all()
+
+                if attention_changed:
+                    self._publish_attention(attention)
+                if public_frame is not None:
+                    EVENT_BROKER.publish("realsense.frame", public_frame)
+        except Exception as error:
+            stop_event.set()
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+            with self.lock:
+                self.last_error = str(error)
+                if self.pipeline is pipeline:
+                    detector = self.focus_detector
+                    self.pipeline = None
+                    self.profile = None
+                    self.worker = None
+                    self.focus_detector = None
+                    self.depth_scale = None
+                    self.latest_frame_data = None
+                    self.latest_raw_frame = None
+                    self.active = False
+                    CAMERA_STATE["isActive"] = False
+                    if CAMERA_STATE.get("source") == "realsense":
+                        CAMERA_STATE["source"] = "builtin"
+                else:
+                    detector = None
+            if detector:
+                try:
+                    detector.close()
+                except Exception:
+                    pass
+            record = {
+                "id": f"attention-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+                "timestamp": int(time.time() * 1000),
+                "state": "unknown",
+                "confidence": None,
+                "source": "realsense-runtime",
+                "reason": self.last_error,
+                "modelVersion": "runtime-1",
+            }
+            with self.lock:
+                self.latest_attention = record
+            self._publish_attention(record)
+
+    def latest_frame(self):
+        with self.lock:
+            if self.latest_frame_data is None:
+                return None
+            return json.loads(json.dumps(self.latest_frame_data))
+
     def start(self, payload=None):
-        if self.active:
-            return self.status()
+        with self.lock:
+            if self.active:
+                return self.status()
 
         rs = self._load_sdk()
         config_values = self._read_stream_config(payload)
-        devices = self._query_devices()
+        try:
+            devices = self._query_devices()
+        except Exception as error:
+            message = self._inaccessible_usb_message() or str(error)
+            self.last_error = message
+            raise RuntimeError(message) from error
         if not devices:
             message = self._inaccessible_usb_message()
             if not message:
                 message = "No Intel RealSense devices detected. Connect a camera before starting the RealSense source."
             self.last_error = message
             raise RuntimeError(message)
-        if config_values["serial"] and not any(self._device_serial(device) == config_values["serial"] for device in devices):
-            message = f"Intel RealSense device with serial {config_values['serial']} was not detected."
-            self.last_error = message
-            raise RuntimeError(message)
+
+        selected_devices = devices
+        if config_values["serial"]:
+            selected_devices = [
+                device for device in devices if self._device_serial(device) == config_values["serial"]
+            ]
+            if not selected_devices:
+                message = f"Intel RealSense device with serial {config_values['serial']} was not detected."
+                self.last_error = message
+                raise RuntimeError(message)
 
         pipeline = rs.pipeline()
         config = rs.config()
@@ -418,7 +764,7 @@ class RealSenseAdapter:
             config.enable_device(config_values["serial"])
         if config_values["enableColor"]:
             color_profile = self._choose_video_profile(
-                devices,
+                selected_devices,
                 "color",
                 rs.stream.color,
                 rs.format.rgb8,
@@ -438,7 +784,7 @@ class RealSenseAdapter:
             )
         if config_values["enableDepth"]:
             depth_profile = self._choose_video_profile(
-                devices,
+                selected_devices,
                 "depth",
                 rs.stream.depth,
                 rs.format.z16,
@@ -458,47 +804,114 @@ class RealSenseAdapter:
             )
 
         try:
-            self.profile = pipeline.start(config)
-            self.pipeline = pipeline
-            self.active = True
-            self.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            self.stream_config = config_values
-            self.last_error = ""
-            CAMERA_STATE["source"] = "realsense"
-            CAMERA_STATE["isActive"] = True
-            CAMERA_STATE["windowCreated"] = False
-            CAMERA_STATE["storagePath"] = self._records_dir()
+            profile = pipeline.start(config)
+            device = profile.get_device()
+            device_info = self._device_info(device)
+            depth_scale = None
+            if config_values["enableDepth"]:
+                try:
+                    depth_scale = device.first_depth_sensor().get_depth_scale()
+                except Exception:
+                    depth_scale = None
+            detector = FocusEstimator() if config_values.get("focusEnabled", True) else None
+            stop_event = threading.Event()
+            worker = threading.Thread(
+                target=self._stream_loop,
+                args=(pipeline, stop_event),
+                name="sya-realsense-stream",
+                daemon=True,
+            )
+            with self.lock:
+                self.profile = profile
+                self.pipeline = pipeline
+                self.active = True
+                self.started_at = utc_timestamp()
+                self.stream_config = config_values
+                self.device_cache = [device_info]
+                self.device_serial = device_info.get("serialNumber", "")
+                self.depth_scale = depth_scale
+                self.latest_frame_data = None
+                self.latest_raw_frame = None
+                self.latest_attention = None
+                self.focus_detector = detector
+                self.stop_event = stop_event
+                self.worker = worker
+                self.last_error = ""
+                self.preview_error = ""
+                CAMERA_STATE["source"] = "realsense"
+                CAMERA_STATE["isActive"] = True
+                CAMERA_STATE["windowCreated"] = False
+                CAMERA_STATE["storagePath"] = self._records_dir()
+            worker.start()
             return self.status()
         except Exception as error:
-            self.pipeline = None
-            self.profile = None
-            self.active = False
-            self.last_error = str(error)
-            raise
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+            with self.lock:
+                self.pipeline = None
+                self.profile = None
+                self.active = False
+                self.last_error = self._inaccessible_usb_message() or str(error)
+            raise RuntimeError(self.last_error) from error
 
     def stop(self, _payload=None):
-        if self.pipeline:
+        with self.lock:
+            pipeline = self.pipeline
+            worker = self.worker
+            detector = self.focus_detector
+            was_active = self.active or pipeline is not None
+            self.stop_event.set()
+
+        if pipeline:
             try:
-                self.pipeline.stop()
+                pipeline.stop()
             except Exception as error:
-                self.last_error = str(error)
-        self.pipeline = None
-        self.profile = None
-        self.active = False
-        CAMERA_STATE["isActive"] = False
-        if CAMERA_STATE.get("source") == "realsense":
-            CAMERA_STATE["source"] = "builtin"
+                if not self.last_error:
+                    self.last_error = str(error)
+        if worker and worker is not threading.current_thread():
+            worker.join(timeout=6)
+            if worker.is_alive():
+                self.last_error = "Timed out while stopping the RealSense acquisition worker."
+        if detector:
+            try:
+                detector.close()
+            except Exception as error:
+                if not self.last_error:
+                    self.last_error = f"Failed to release focus inference: {error}"
+
+        with self.lock:
+            self.pipeline = None
+            self.profile = None
+            self.worker = None
+            self.focus_detector = None
+            self.depth_scale = None
+            self.latest_frame_data = None
+            self.latest_raw_frame = None
+            self.active = False
+            CAMERA_STATE["isActive"] = False
+            if CAMERA_STATE.get("source") == "realsense":
+                CAMERA_STATE["source"] = "builtin"
+
+        if was_active:
+            timestamp_ms = int(time.time() * 1000)
+            record = {
+                "id": f"attention-{timestamp_ms}-{uuid.uuid4().hex[:8]}",
+                "timestamp": timestamp_ms,
+                "state": "unknown",
+                "confidence": None,
+                "source": "realsense-runtime",
+                "reason": "RealSense monitoring stopped.",
+                "modelVersion": "runtime-1",
+            }
+            with self.lock:
+                self.latest_attention = record
+            self._publish_attention(record)
         return self.status()
 
     def _depth_scale(self):
-        if not self.profile:
-            return None
-        try:
-            device = self.profile.get_device()
-            sensor = device.first_depth_sensor()
-            return sensor.get_depth_scale()
-        except Exception:
-            return None
+        return self.depth_scale
 
     def _sample_dir(self, payload):
         if isinstance(payload, dict) and isinstance(payload.get("sessionId"), str) and payload["sessionId"].strip():
@@ -508,19 +921,36 @@ class RealSenseAdapter:
         else:
             session_id = "inference"
 
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", session_id) or session_id in {".", ".."}:
+            raise ValueError("RealSense sessionId contains unsupported characters.")
+
         sample_id = "{}-{}".format(
             time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
             uuid.uuid4().hex[:8],
         )
-        return sample_id, os.path.join(self._records_dir(), "realsense", session_id, sample_id)
+        records_root = os.path.realpath(os.path.join(self._records_dir(), "realsense"))
+        sample_dir = os.path.realpath(os.path.join(records_root, session_id, sample_id))
+        if os.path.commonpath([records_root, sample_dir]) != records_root:
+            raise ValueError("RealSense sample path must stay inside the configured records directory.")
+        return sample_id, sample_dir
 
-    def _write_color_ppm(self, path, frame):
-        width = frame.get_width()
-        height = frame.get_height()
-        data = bytes(frame.get_data())
-        with open(path, "wb") as output:
-            output.write("P6\n{} {}\n255\n".format(width, height).encode("ascii"))
-            output.write(data)
+    def _write_binary_atomic(self, path, data):
+        temp_path = f"{path}.tmp-{uuid.uuid4().hex[:8]}"
+        descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(data)
+            os.replace(temp_path, path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
+    def _write_color_ppm(self, path, width, height, data):
+        body = "P6\n{} {}\n255\n".format(width, height).encode("ascii") + data
+        self._write_binary_atomic(path, body)
         return {
             "width": width,
             "height": height,
@@ -530,17 +960,14 @@ class RealSenseAdapter:
             "bytes": len(data),
         }
 
-    def _write_depth_pgm(self, path, frame):
-        width = frame.get_width()
-        height = frame.get_height()
+    def _write_depth_pgm(self, path, width, height, raw_data):
         values = array.array("H")
-        values.frombytes(bytes(frame.get_data()))
+        values.frombytes(raw_data)
         if sys.byteorder == "little":
             values.byteswap()
         data = values.tobytes()
-        with open(path, "wb") as output:
-            output.write("P5\n{} {}\n65535\n".format(width, height).encode("ascii"))
-            output.write(data)
+        body = "P5\n{} {}\n65535\n".format(width, height).encode("ascii") + data
+        self._write_binary_atomic(path, body)
         return {
             "width": width,
             "height": height,
@@ -566,43 +993,56 @@ class RealSenseAdapter:
             timeout_ms = 5000
 
         try:
-            frames = self.pipeline.wait_for_frames(timeout_ms)
-            color_frame = frames.get_color_frame()
-            depth_frame = frames.get_depth_frame()
-            if not color_frame and not depth_frame:
-                raise RuntimeError("RealSense did not return color or depth frames.")
+            with self.frame_condition:
+                ready = self.frame_condition.wait_for(
+                    lambda: self.latest_raw_frame is not None or not self.active,
+                    timeout=timeout_ms / 1000,
+                )
+                if not ready or self.latest_raw_frame is None:
+                    raise RuntimeError("RealSense did not return color or depth frames before the capture timeout.")
+                raw_frame = dict(self.latest_raw_frame)
+                attention = dict(self.latest_attention) if self.latest_attention else None
 
             sample_id, sample_dir = self._sample_dir(payload)
-            os.makedirs(sample_dir, exist_ok=True)
-            captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            os.makedirs(sample_dir, mode=0o700, exist_ok=True)
+            captured_at = raw_frame["capturedAt"]
             result = {
                 "source": "realsense",
                 "sampleId": sample_id,
                 "capturedAt": captured_at,
+                "frameNumber": raw_frame["frameNumber"],
                 "path": sample_dir,
                 "label": payload.get("label") or (self.training_session or {}).get("label", ""),
                 "color": None,
                 "depth": None,
+                "attention": attention,
             }
 
-            if color_frame:
-                result["color"] = self._write_color_ppm(os.path.join(sample_dir, "color.ppm"), color_frame)
-            if depth_frame:
-                result["depth"] = self._write_depth_pgm(os.path.join(sample_dir, "depth.pgm"), depth_frame)
+            if raw_frame["colorBytes"]:
+                result["color"] = self._write_color_ppm(
+                    os.path.join(sample_dir, "color.ppm"),
+                    raw_frame["colorWidth"],
+                    raw_frame["colorHeight"],
+                    raw_frame["colorBytes"],
+                )
+            if raw_frame["depthBytes"]:
+                result["depth"] = self._write_depth_pgm(
+                    os.path.join(sample_dir, "depth.pgm"),
+                    raw_frame["depthWidth"],
+                    raw_frame["depthHeight"],
+                    raw_frame["depthBytes"],
+                )
 
             metadata_path = os.path.join(sample_dir, "metadata.json")
-            with open(metadata_path, "w", encoding="utf-8") as metadata:
-                json.dump(result, metadata, indent=2)
-                metadata.write("\n")
+            metadata_body = (json.dumps(result, indent=2) + "\n").encode("utf-8")
+            self._write_binary_atomic(metadata_path, metadata_body)
             result["metadataPath"] = metadata_path
 
-            self.total_frames += 1
-            self.last_frame_time = captured_at
+            self.total_samples += 1
             self.last_sample_path = sample_dir
-            CAMERA_STATE["totalFrames"] = self.total_frames
-            CAMERA_STATE["lastFrameTime"] = captured_at
-            CAMERA_STATE["faceDetected"] = False
             CAMERA_STATE["storagePath"] = self._records_dir()
+            if self.training_session or payload.get("purpose") == "training":
+                EVENT_BROKER.publish("realsense.training.sample", result)
             return result
         finally:
             if stop_after_capture:
@@ -616,16 +1056,23 @@ class RealSenseAdapter:
                 time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
                 uuid.uuid4().hex[:8],
             )
+        session_id = session_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", session_id) or session_id in {".", ".."}:
+            raise ValueError("RealSense sessionId contains unsupported characters.")
+        records_root = os.path.realpath(os.path.join(self._records_dir(), "realsense"))
+        session_path = os.path.realpath(os.path.join(records_root, session_id))
+        if os.path.commonpath([records_root, session_path]) != records_root:
+            raise ValueError("RealSense training path must stay inside the configured records directory.")
 
         self.training_session = {
-            "sessionId": session_id.strip(),
+            "sessionId": session_id,
             "label": payload.get("label") if isinstance(payload.get("label"), str) else "",
             "taskId": payload.get("taskId") if isinstance(payload.get("taskId"), str) else "",
             "notes": payload.get("notes") if isinstance(payload.get("notes"), str) else "",
             "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "path": os.path.join(self._records_dir(), "realsense", session_id.strip()),
+            "path": session_path,
         }
-        os.makedirs(self.training_session["path"], exist_ok=True)
+        os.makedirs(self.training_session["path"], mode=0o700, exist_ok=True)
         if payload.get("autoStart", True) is not False:
             self.start(payload)
         return self.status()
@@ -937,6 +1384,7 @@ def dispatch_action(action, payload=None, query=None):
         "realsense.start": lambda: REALSENSE.start(payload),
         "realsense.stop": lambda: REALSENSE.stop(payload),
         "realsense.capture": lambda: REALSENSE.capture(payload),
+        "realsense.frame.latest": REALSENSE.latest_frame,
         "realsense.training.start": lambda: REALSENSE.training_start(payload),
         "realsense.training.stop": lambda: REALSENSE.training_stop(payload),
         "storage.stats": storage_stats,
@@ -972,6 +1420,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             "/api/monitor/camera/sources": "camera.sources",
             "/api/monitor/realsense/status": "realsense.status",
             "/api/monitor/realsense/devices": "realsense.devices",
+            "/api/monitor/realsense/frame/latest": "realsense.frame.latest",
             "/api/monitor/storage/stats": "storage.stats",
             "/api/monitor/storage/screen-records": "storage.screenRecords",
             "/api/monitor/storage/camera-records": "storage.cameraRecords",
@@ -1032,7 +1481,6 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
     def _send_json(self, status_code, payload):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(payload).encode())
 
@@ -1058,14 +1506,31 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, config_status())
 
     def _send_event_stream(self):
+        subscriber = EVENT_BROKER.subscribe()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "keep-alive")
         self.end_headers()
-        event = json.dumps({"functionId": "monitor", "event": "ready", "payload": {}})
-        self.wfile.write(f"event: ready\ndata: {event}\n\n".encode())
-        self.wfile.flush()
+        ready = json.dumps({"functionId": "monitor", "event": "ready", "payload": {}})
+        try:
+            self.wfile.write(f"event: ready\ndata: {ready}\n\n".encode())
+            self.wfile.flush()
+            while True:
+                try:
+                    message = subscriber.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                    continue
+                event_name = message["event"]
+                event_body = json.dumps(message, separators=(",", ":"))
+                self.wfile.write(f"event: {event_name}\ndata: {event_body}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            EVENT_BROKER.unsubscribe(subscriber)
 
     def _proxy_llm(self, req_data):
         if not isinstance(req_data, dict):
@@ -1102,7 +1567,6 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 resp_body = resp.read()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(resp_body)
         except urllib.error.HTTPError as e:
@@ -1113,7 +1577,6 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
@@ -1122,7 +1585,8 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     port = resolve_port()
     api_config = load_api_config()
-    with http.server.HTTPServer(("127.0.0.1", port), ProxyHandler) as httpd:
+    with http.server.ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler) as httpd:
+        httpd.daemon_threads = True
         print(f"Serving on http://127.0.0.1:{port}")
         print(f"Static files from: {STATIC_DIR}")
         print("Health at: GET /health")
@@ -1132,4 +1596,7 @@ if __name__ == "__main__":
             print(f"API path: {api_config['path']}")
         else:
             print("API config: missing; copy config.example.json to config.local.json")
-        httpd.serve_forever()
+        try:
+            httpd.serve_forever()
+        finally:
+            REALSENSE.stop()
