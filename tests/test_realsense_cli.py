@@ -121,6 +121,7 @@ class RealSenseCliTests(unittest.TestCase):
     def test_smoke_rejects_non_l515_device(self):
         camera_info = types.SimpleNamespace(product_id="product_id", serial_number="serial_number")
         fake_rs = types.SimpleNamespace(
+            __version__="2.54.2",
             camera_info=camera_info,
             context=lambda: types.SimpleNamespace(
                 query_devices=lambda: [FakeDevice("0b07")]
@@ -143,13 +144,17 @@ class RealSenseCliTests(unittest.TestCase):
         self.assertTrue(report["firmwareSupported"])
 
     def test_smoke_rejects_sdk_version_mismatch(self):
-        result, report = self.run_smoke(fake_realsense(version="2.55.1"))
+        fake_rs = fake_realsense(version="2.55.1")
+        fake_rs.pipeline = lambda: self.fail("pipeline must not start with an unsupported SDK")
+        result, report = self.run_smoke(fake_rs)
         self.assertEqual(result, 2)
         self.assertFalse(report["ok"])
         self.assertEqual(report["sdkVersion"], "2.55.1")
 
     def test_smoke_rejects_firmware_mismatch(self):
-        result, report = self.run_smoke(fake_realsense(firmware="1.5.7.1"))
+        fake_rs = fake_realsense(firmware="1.5.7.1")
+        fake_rs.pipeline = lambda: self.fail("pipeline must not start with unsupported firmware")
+        result, report = self.run_smoke(fake_rs)
         self.assertEqual(result, 2)
         self.assertFalse(report["ok"])
         self.assertFalse(report["firmwareSupported"])

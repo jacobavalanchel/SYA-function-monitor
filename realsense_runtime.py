@@ -1,6 +1,7 @@
 """Runtime helpers for RealSense preview events and local focus inference."""
 
 import base64
+from datetime import datetime, timezone
 import io
 import queue
 import threading
@@ -38,7 +39,7 @@ ATTENTION_THRESHOLDS = {
 
 
 def utc_timestamp():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _ratio(first, middle, last):

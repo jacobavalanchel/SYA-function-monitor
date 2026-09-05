@@ -29,7 +29,7 @@ SDK_COMMIT = "2dbaaf5964490cb02f811cf2ed38c8a893f5c027"
 SDK_REPOSITORY = "https://github.com/IntelRealSense/librealsense.git"
 L515_PRODUCT_ID = "0b64"
 SUPPORTED_FIRMWARE = "1.5.8.1"
-PATCH_SHA256 = "99007d67cc3cc92da737796e302dc6dc24f71be323c4e1a9f589112ed787faad"
+PATCH_SHA256 = "4e59f0a0054cc06b1d73333e02da8855b28f8217a2999901552f158f2f16d0c7"
 MIN_PYTHON = (3, 9)
 MAX_PYTHON = (3, 12)
 MODULE_ROOT = Path(__file__).resolve().parents[1]
@@ -638,10 +638,17 @@ def smoke(args):
     started_at = time.monotonic()
     result = None
     sdk_version = ""
+    serial = ""
+    product_id = ""
+    firmware = ""
     try:
         import pyrealsense2 as rs
 
         sdk_version = getattr(rs, "__version__", "")
+        if sdk_version != SDK_VERSION:
+            raise RuntimeError(
+                f"pyrealsense2 must be exactly {SDK_VERSION}; detected {sdk_version or 'unknown'}."
+            )
         l515_devices = []
         for device in list(rs.context().query_devices()):
             product_id = device.get_info(rs.camera_info.product_id)
@@ -654,7 +661,15 @@ def smoke(args):
             target = f" with serial {args.serial}" if args.serial else ""
             raise RuntimeError(f"No SDK-accessible Intel RealSense L515{target} was detected.")
 
-        selected_serial = l515_devices[0][1]
+        selected_device, selected_serial = l515_devices[0]
+        serial = selected_serial
+        product_id = normalize_product_id(selected_device.get_info(rs.camera_info.product_id))
+        firmware = selected_device.get_info(rs.camera_info.firmware_version)
+        if firmware != SUPPORTED_FIRMWARE:
+            raise RuntimeError(
+                f"Intel RealSense L515 firmware must be exactly {SUPPORTED_FIRMWARE}; "
+                f"detected {firmware}. Firmware updates are never performed automatically."
+            )
         pipeline = rs.pipeline()
         config = rs.config()
         config.enable_device(selected_serial)
@@ -709,6 +724,13 @@ def smoke(args):
                 and ("access" in str(error).lower() or "permission" in str(error).lower())
             ),
         }
+        if serial:
+            result["serialNumber"] = serial
+        if product_id:
+            result["productId"] = product_id
+        if firmware:
+            result["firmwareVersion"] = firmware
+            result["firmwareSupported"] = firmware == SUPPORTED_FIRMWARE
     finally:
         if started:
             try:

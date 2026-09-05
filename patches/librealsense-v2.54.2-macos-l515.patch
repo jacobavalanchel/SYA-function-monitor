@@ -837,12 +837,16 @@ index e74f1c3d5..fb5cb48bd 100644
 -    std::mutex _blocking_invoke_mutex;
 -
 diff --git a/wrappers/python/CMakeLists.txt b/wrappers/python/CMakeLists.txt
-index 8354f84ca..7f26789ce 100644
+index 8354f84ca..68ab32c96 100644
 --- a/wrappers/python/CMakeLists.txt
 +++ b/wrappers/python/CMakeLists.txt
 @@ -128,0 +129 @@ endif()
 +if(BUILD_LEGACY_PYBACKEND)
-@@ -165,0 +167,10 @@ install(TARGETS pybackend2 pyrealsense2
+@@ -148,0 +150 @@ endif()
++endif()
+@@ -158,0 +161 @@ configure_package_config_file(../../CMake/pyrealsense2Config.cmake.in pyrealsens
++if(BUILD_LEGACY_PYBACKEND)
+@@ -165,0 +169,10 @@ install(TARGETS pybackend2 pyrealsense2
 +target_include_directories(pybackend2 PRIVATE ../../src)
 +else()
 +install(TARGETS pyrealsense2
@@ -853,5 +857,5 @@ index 8354f84ca..7f26789ce 100644
 +)
 +endif()
 +
-@@ -179 +189,0 @@ install(FILES "${CMAKE_BINARY_DIR}/wrappers/python/pyrealsense2ConfigVersion.cma
+@@ -179 +191,0 @@ install(FILES "${CMAKE_BINARY_DIR}/wrappers/python/pyrealsense2ConfigVersion.cma
 -target_include_directories(pybackend2 PRIVATE ../../src)

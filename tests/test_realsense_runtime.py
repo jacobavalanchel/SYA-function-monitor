@@ -8,6 +8,7 @@ from realsense_runtime import (
     FocusEstimator,
     classify_attention_landmarks,
     encode_rgb_jpeg,
+    utc_timestamp,
 )
 
 
@@ -65,6 +66,9 @@ def centered_landmarks():
 
 
 class RealSenseRuntimeTests(unittest.TestCase):
+    def test_utc_timestamp_preserves_millisecond_session_boundary(self):
+        self.assertRegex(utc_timestamp(), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+
     def test_centered_landmarks_are_focused(self):
         state, directions, ratios = classify_attention_landmarks(centered_landmarks())
         self.assertEqual(state, "focused")
