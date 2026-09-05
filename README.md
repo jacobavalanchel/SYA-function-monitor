@@ -75,6 +75,7 @@ Operational monitor endpoints:
 | `POST` | `/api/monitor/realsense/start` | `realsense.start` |
 | `POST` | `/api/monitor/realsense/stop` | `realsense.stop` |
 | `POST` | `/api/monitor/realsense/capture` | `realsense.capture` |
+| `GET` | `/api/monitor/realsense/frame/latest` | `realsense.frame.latest` |
 | `POST` | `/api/monitor/realsense/training/start` | `realsense.training.start` |
 | `POST` | `/api/monitor/realsense/training/stop` | `realsense.training.stop` |
 | `GET` | `/api/monitor/storage/stats` | `storage.stats` |
@@ -98,12 +99,58 @@ The settings page applies an RGB-only recording path: depth is disabled for this
 path so SYA records 2D RGB video for monitor, inference, and training source
 capture.
 
-Install the Intel RealSense SDK and Python bindings in the environment that
-runs `server.py`:
+### Pinned macOS L515 Runtime
+
+Do not install an arbitrary `pyrealsense2` wheel for the macOS L515 path. The
+repository installer builds the reviewed SDK and Python bindings with these
+pins:
+
+- librealsense `2.54.2` at commit
+  `2dbaaf5964490cb02f811cf2ed38c8a893f5c027`
+- pybind11 at commit `0bd8896a4010f2d91b2340570c24fa08606ec406`
+- patch SHA-256
+  `eb3acdba968cb716133a176a0051af7d06568594cd3b1d8a65f6d3b1202317c1`
+- L515 product ID `0b64` and supported firmware `1.5.8.1`
+- Python 3.9, 3.10, or 3.11
+
+Install Homebrew `cmake` and `libusb`, then run:
 
 ```bash
-python3 -m pip install pyrealsense2
+python3 scripts/realsense_l515.py install
+MONITOR_REALSENSE_VENV="$HOME/.sya/monitor/.venv" \
+  scripts/realsense-l515 doctor --json
 ```
+
+The default SDK root is `~/.sya/monitor/realsense` and the default venv is
+`~/.sya/monitor/.venv`. The installer verifies the patch checksum, target
+Python architecture, exact SDK version, module location, and repeat application
+of the source patch. It does not install a firmware image or firmware updater,
+and it never elevates itself.
+
+`doctor` can detect the USB device without being able to open it through the
+SDK. If it reports `privilegeRequired: true`, stop and review the local macOS
+camera/USB access policy. Do not automate `sudo`. The bounded `smoke` command
+checks SDK and firmware before creating a streaming pipeline, so an unsupported
+version cannot start acquisition.
+
+The arm64 clean-install acceptance path builds twice in the same isolated root,
+runs all 43 Python tests in the installed venv, checks the installed CMake
+packages, and executes a MediaPipe FaceMesh inference without opening a camera.
+
+### Live Preview and Focus Events
+
+While RealSense is active, the runtime keeps only the latest RGB-D sample in
+memory and publishes a bounded JPEG preview at approximately 2 FPS. Consumers
+can poll `realsense.frame.latest` or subscribe to SSE events declared by the
+manifest:
+
+- `realsense.frame` for preview and depth metadata
+- `attention.status` for `focused`, `distracted`, `away`, or `unknown`
+- `realsense.training.sample` for persisted training captures
+
+Five consecutive matching observations are required before focus state
+changes. Five consecutive no-face observations produce `away`; acquisition or
+inference failures fail closed to `unknown` and clear stale preview data.
 
 List sources and connected devices:
 

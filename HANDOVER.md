@@ -6,6 +6,22 @@ This file was originally written when the demo lived in a
 `webcam-attention-demo/` directory. The directory layer has since been removed,
 and the demo files now live directly under the monitor function module.
 
+## Current Desktop Runtime
+
+This handover describes the legacy standalone browser demo only. The SYA
+desktop integration now uses the Monitor `v0.2.0` local HTTP runtime in
+`server.py` and `realsense_runtime.py`. That runtime provides a pinned macOS
+L515 SDK installer, RGB-D capture, bounded JPEG preview, server-side MediaPipe
+focus inference, `realsense.frame` and `attention.status` SSE events, and local
+training samples. See `README.md` and `api.openapi.json` for the supported
+contract.
+
+The desktop runtime is loopback-only. Electron gives each artifact process a
+random `FUNCTION_RUNTIME_TOKEN` and sends it as a Bearer token for health,
+actions, and SSE. The CLI never elevates itself and contains no firmware update
+operation. The browser demo below remains useful for comparison, but it is not
+the packaged Focus Monitor data path.
+
 ## What This Is
 
 A single-page browser app that replicates the attention detection logic from
@@ -131,7 +147,7 @@ A copy already exists at:
 | `../related-work-search/assessment-of-cognitive-load-and-emotion/face_landmarker.task` | FaceLandmarker model file |
 | `../related-work-search/assessment-of-cognitive-load-and-emotion/conda-env-py310/` | Python env for running the headless version |
 
-## Possible Next Steps
+## Legacy Demo Next Steps
 
 - Add in-page threshold calibration (mirror the original `calibrate_thresholds.py` flow)
 - Export per-session attention timeline as CSV
