@@ -11,7 +11,12 @@
     "app/src/types/electron.d.ts",
     "function/monitor/index.html",
     "function/monitor/server.py",
+    "function/monitor/realsense_runtime.py",
     "function/monitor/config.example.json",
+    "function/monitor/requirements-realsense.txt",
+    "function/monitor/scripts/realsense-l515",
+    "function/monitor/scripts/realsense_l515.py",
+    "function/monitor/patches/librealsense-v2.54.2-macos-l515.patch",
     "function/monitor/src/main.ts",
     "function/monitor/test_vision_support.py",
     "function/monitor/HANDOVER.md"
