@@ -4,6 +4,18 @@ index e61f5a20a..60b7ecc8f 100644
 +++ b/CMake/lrs_options.cmake
 @@ -20,0 +21 @@ option(BUILD_PYTHON_BINDINGS "Build Python bindings" OFF)
 +option(BUILD_LEGACY_PYBACKEND "Build deprecated Python backend bindings" OFF)
+diff --git a/CMake/pybind11-download.cmake.in b/CMake/pybind11-download.cmake.in
+index 1d02d4f8d..8033cb53d 100644
+--- a/CMake/pybind11-download.cmake.in
++++ b/CMake/pybind11-download.cmake.in
+@@ -9 +9 @@ ExternalProject_Add(
+-    GIT_TAG        v2.10.3
++    GIT_TAG        0bd8896a4010f2d91b2340570c24fa08606ec406
+@@ -12 +12 @@ ExternalProject_Add(
+-    GIT_SHALLOW    ON        # No history needed (requires cmake 3.6)
++    GIT_SHALLOW    OFF
+@@ -19 +18,0 @@ ExternalProject_Add(
+-
 diff --git a/CMake/unix_config.cmake b/CMake/unix_config.cmake
 index 1a8bd74db..a76db02cc 100644
 --- a/CMake/unix_config.cmake

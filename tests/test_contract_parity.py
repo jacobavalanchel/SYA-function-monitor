@@ -47,6 +47,8 @@ class ContractParityTests(unittest.TestCase):
         self.assertNotIn("tools/fw-update", patch)
         self.assertNotIn("rs-fw-update", cli)
         self.assertNotIn("L51X_FW_Image", cli)
+        self.assertIn("0bd8896a4010f2d91b2340570c24fa08606ec406", patch)
+        self.assertIn("GIT_SHALLOW    OFF", patch)
 
 
 if __name__ == "__main__":

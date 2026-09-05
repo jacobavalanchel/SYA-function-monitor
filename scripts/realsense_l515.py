@@ -27,9 +27,10 @@ except ImportError:  # pragma: no cover - installer is macOS-only
 SDK_VERSION = "2.54.2"
 SDK_COMMIT = "2dbaaf5964490cb02f811cf2ed38c8a893f5c027"
 SDK_REPOSITORY = "https://github.com/IntelRealSense/librealsense.git"
+PYBIND11_COMMIT = "0bd8896a4010f2d91b2340570c24fa08606ec406"
 L515_PRODUCT_ID = "0b64"
 SUPPORTED_FIRMWARE = "1.5.8.1"
-PATCH_SHA256 = "4e59f0a0054cc06b1d73333e02da8855b28f8217a2999901552f158f2f16d0c7"
+PATCH_SHA256 = "eb3acdba968cb716133a176a0051af7d06568594cd3b1d8a65f6d3b1202317c1"
 MIN_PYTHON = (3, 9)
 MAX_PYTHON = (3, 12)
 MODULE_ROOT = Path(__file__).resolve().parents[1]
@@ -610,6 +611,7 @@ def _install_runtime(args, root, venv, source, libusb_prefix):
         "installedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "sdkVersion": SDK_VERSION,
         "sdkCommit": SDK_COMMIT,
+        "pybind11Commit": PYBIND11_COMMIT,
         "patch": str(PATCH_PATH),
         "patchSha256": PATCH_SHA256,
         "patchState": patch_state,
