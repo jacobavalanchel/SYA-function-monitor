@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { runtimeTreeSha256 } from './hash-runtime.mjs';
+import { createStartupTraceCollector } from './startup-trace.mjs';
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'];
 const PATH_FIELDS = ['$ref', 'summary', 'description', 'servers', 'parameters'];
@@ -72,7 +73,7 @@ async function freePort() {
 
 // Fixed loopback destination, no redirects, bounded JSON, and immediate stream
 // cancellation. Never include response bodies or runtime logs in diagnostics.
-function request(port, probe, token, { timeoutMs, signal, headersOnly = false }) {
+function request(port, probe, token, { timeoutMs, signal, headersOnly = false, onHeaders }) {
   return new Promise((resolve, reject) => {
     const headers = { Accept: headersOnly ? '*/*' : 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -81,6 +82,7 @@ function request(port, probe, token, { timeoutMs, signal, headersOnly = false })
     const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
     const req = http.request({ hostname: '127.0.0.1', port, path: probe.path, method: probe.method, headers, signal: requestSignal }, res => {
       const result = { status: res.statusCode, headers: res.headers };
+      onHeaders?.(res.statusCode);
       if (headersOnly) { resolve(result); res.destroy(); req.destroy(); return; }
       const chunks = []; let size = 0;
       res.on('data', chunk => {
@@ -175,13 +177,23 @@ async function stopRuntime(child, timeoutMs) {
   if (!(await wait())) throw inspectError ?? new Error('Owned runtime process group did not exit.');
 }
 
-export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, requestTimeoutMs = 1500, stopTimeoutMs = 2000, signal } = {}) {
+export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, requestTimeoutMs = 1500, stopTimeoutMs = 2000, signal, collectStartupTrace = false } = {}) {
   if (process.platform === 'win32') throw new Error('Staged runtime smoke currently requires a POSIX runner.');
   for (const value of [startupTimeoutMs, requestTimeoutMs, stopTimeoutMs]) if (!Number.isSafeInteger(value) || value < 1 || value > 30000) throw new Error('Invalid smoke timeout.');
   const runtimeDir = path.resolve(directory);
   const { manifest, openapi, executable, args, probes, digest } = contract(runtimeDir);
   const state = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-staged-smoke-'));
   let child; let failure; let spawnFailed = false;
+  let closePromise;
+  let spawnedAt;
+  const hostTimings = { clock: 'node-hrtime-from-spawn-before', startupTimeoutMs };
+  const lifecycle = { outcome: 'pending', spawn: 'not_started', spawnErrorCode: null,
+    exitCode: null, signalCode: null, closeCode: null, closeSignal: null, close: 'not_started' };
+  const errorCode = error => ['EACCES', 'EAGAIN', 'EINVAL', 'EIO', 'EMFILE', 'ENFILE', 'ENOENT', 'ENOEXEC', 'ENOMEM', 'ENOTDIR', 'EPERM', 'ETXTBSY'].includes(error?.code) ? error.code : 'OTHER';
+  const signalCode = value => value === null ? null : ['SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGINT', 'SIGKILL', 'SIGPIPE', 'SIGQUIT', 'SIGSEGV', 'SIGTERM', 'SIGTRAP', 'SIGUSR1', 'SIGUSR2'].includes(value) ? value : 'OTHER';
+  const exitCode = value => Number.isSafeInteger(value) ? value : null;
+  const elapsed = () => spawnedAt === undefined ? 0 : Number(process.hrtime.bigint() - spawnedAt) / 1e6;
+  const collector = collectStartupTrace ? createStartupTraceCollector({ nowMs: elapsed }) : null;
   try {
     const home = path.join(state, 'home'), records = path.join(state, 'records'), temporary = path.join(state, 'tmp');
     for (const dir of [home, records, temporary]) fs.mkdirSync(dir, { mode: 0o700 });
@@ -192,8 +204,11 @@ export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, r
     const expectedProof = createHmac('sha256', proofKey).update('sya-runtime-v1').digest();
     const port = await freePort();
     signal?.throwIfAborted();
-    child = spawn(executable, args, {
-      cwd: runtimeDir, detached: true, shell: false, stdio: 'ignore',
+    spawnedAt = process.hrtime.bigint();
+    hostTimings.spawnBeforeMs = 0;
+    lifecycle.spawn = 'pending';
+    try { child = spawn(executable, args, {
+      cwd: runtimeDir, detached: true, shell: false, stdio: collector ? ['ignore', 'ignore', 'pipe'] : 'ignore',
       env: {
         ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
         ...(process.env.MONITOR_PYTHON ? { MONITOR_PYTHON: process.env.MONITOR_PYTHON } : {}),
@@ -201,22 +216,47 @@ export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, r
         TMPDIR: temporary, TMP: temporary, TEMP: temporary,
         PORT: String(port), FUNCTION_RUNTIME_TOKEN: token, FUNCTION_RUNTIME_PROOF_KEY: proofKey, PYTHONDONTWRITEBYTECODE: '1',
       },
-    });
-    child.once('error', () => { spawnFailed = true; });
+    }); } catch (error) {
+      hostTimings.errorMs = elapsed(); lifecycle.spawn = 'error'; lifecycle.spawnErrorCode = errorCode(error);
+      lifecycle.outcome = 'spawn_error'; throw new Error('Runtime spawn failed.');
+    }
+    hostTimings.spawnReturnMs = elapsed();
+    child.stderr?.on('data', chunk => collector?.push(chunk));
+    child.once('spawn', () => { lifecycle.spawn = 'spawned'; hostTimings.spawnEventMs = elapsed(); });
+    child.once('error', error => { spawnFailed = true; lifecycle.spawn = 'error'; lifecycle.spawnErrorCode = errorCode(error); hostTimings.errorMs = elapsed(); });
+    child.once('exit', (code, signal) => { lifecycle.exitCode = exitCode(code); lifecycle.signalCode = signalCode(signal); hostTimings.exitMs = elapsed(); });
+    lifecycle.close = 'pending';
+    closePromise = new Promise(resolve => child.once('close', (code, signal) => {
+      lifecycle.closeCode = exitCode(code); lifecycle.closeSignal = signalCode(signal);
+      lifecycle.close = 'closed'; hostTimings.closeMs = elapsed(); resolve(true);
+    }));
     const deadline = Date.now() + startupTimeoutMs;
     let healthy = false;
     while (Date.now() < deadline) {
       signal?.throwIfAborted();
-      if (spawnFailed || child.exitCode !== null || child.signalCode !== null) throw new Error('Runtime exited before authenticated startup completed.');
+      if (spawnFailed || child.exitCode !== null || child.signalCode !== null) {
+        lifecycle.outcome = spawnFailed ? 'spawn_error' : 'runtime_exit';
+        throw new Error('Runtime exited before authenticated startup completed.');
+      }
       let response;
-      try { response = await request(port, { method: 'GET', path: '/health' }, token, { timeoutMs: Math.max(1, Math.min(requestTimeoutMs, deadline - Date.now())), signal }); }
+      try { response = await request(port, { method: 'GET', path: '/health' }, token, {
+        timeoutMs: Math.max(1, Math.min(requestTimeoutMs, deadline - Date.now())), signal,
+        onHeaders: status => {
+          hostTimings.firstHealthHeadersMs ??= elapsed();
+          if (status === 200) hostTimings.firstSuccessfulHealthHeadersMs ??= elapsed();
+        },
+      }); }
       catch { await delay(25); continue; }
+      hostTimings.firstHealthBodyCompleteMs ??= elapsed();
       if (response.status !== 200) { await delay(25); continue; }
+      hostTimings.firstSuccessfulHealthBodyCompleteMs ??= elapsed();
       const proof = response.headers['x-sya-runtime-proof'];
       if (typeof proof !== 'string' || !/^[a-f0-9]{64}$/.test(proof) || !timingSafeEqual(Buffer.from(proof, 'hex'), expectedProof)) throw new Error('Runtime health did not prove spawned-process identity.');
-      jsonResponse(response, '/health', manifest, openapi); healthy = true; break;
+      jsonResponse(response, '/health', manifest, openapi);
+      hostTimings.authenticatedReadyMs = elapsed();
+      healthy = true; break;
     }
-    if (!healthy) throw new Error('Runtime startup timed out.');
+    if (!healthy) { lifecycle.outcome = 'startup_timeout'; throw new Error('Runtime startup timed out.'); }
     for (const probe of probes) {
       for (const authorization of [undefined, wrongToken]) {
         const response = await request(port, probe, authorization, { timeoutMs: requestTimeoutMs, signal, headersOnly: true });
@@ -229,19 +269,43 @@ export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, r
     }
     const stream = await request(port, { method: 'GET', path: SSE_PATH }, token, { timeoutMs: requestTimeoutMs, signal, headersOnly: true });
     if (stream.status !== 200 || !String(stream.headers['content-type']).includes('text/event-stream')) throw new Error('Authenticated SSE handshake failed.');
-    if (child.exitCode !== null || child.signalCode !== null) throw new Error('Runtime exited during smoke.');
-  } catch (error) { failure = signal?.aborted ? new Error('Staged runtime smoke interrupted.') : error; }
+    if (child.exitCode !== null || child.signalCode !== null) { lifecycle.outcome = 'runtime_exit'; throw new Error('Runtime exited during smoke.'); }
+  } catch (error) {
+    if (signal?.aborted) lifecycle.outcome = 'interrupted';
+    else if (lifecycle.outcome === 'pending') lifecycle.outcome = 'validation_failed';
+    failure = signal?.aborted ? new Error('Staged runtime smoke interrupted.') : error;
+  }
   finally {
     const errors = failure ? [failure.message] : [];
     try { await stopRuntime(child, stopTimeoutMs); } catch (error) { errors.push(error.message); }
+    if (collector && closePromise) {
+      // Child exit and group disappearance do not mean stderr has drained.
+      // Bound this final pipe barrier independently of TERM/KILL cleanup.
+      let timer;
+      const closed = await Promise.race([closePromise, new Promise(resolve => {
+        timer = setTimeout(() => resolve(false), stopTimeoutMs);
+      })]);
+      clearTimeout(timer);
+      if (!closed) {
+        lifecycle.close = 'timeout';
+        errors.push('Runtime stdio did not close within the cleanup deadline.');
+        child.stderr?.destroy();
+      }
+    }
     try {
       if (fs.existsSync(path.join(runtimeDir, 'artifact-provenance.json')) || runtimeTreeSha256(runtimeDir) !== digest) errors.push('Staged runtime tree changed during smoke.');
     } catch { errors.push('Staged runtime tree could not be verified after smoke.'); }
-    fs.rmSync(state, { recursive: true, force: true });
-    if (errors.length) failure = new Error(errors.join(' '));
+    try { fs.rmSync(state, { recursive: true, force: true }); }
+    catch { errors.push('Isolated smoke state could not be removed.'); }
+    if (errors.length) {
+      if (!failure) lifecycle.outcome = 'cleanup_failed';
+      failure = new Error(errors.join(' '));
+    }
   }
-  if (failure) throw failure;
-  return { runtimeSha256: digest, authenticatedOperations: probes.length, successfulGetPaths: SAFE_GETS, sseHandshake: true };
+  if (!failure) lifecycle.outcome = 'passed';
+  const diagnostics = collector ? { startupTrace: { ...collector.finish(), hostTimings: { ...hostTimings }, lifecycle: { ...lifecycle } } } : {};
+  if (failure) { Object.assign(failure, diagnostics); throw failure; }
+  return { runtimeSha256: digest, authenticatedOperations: probes.length, successfulGetPaths: SAFE_GETS, sseHandshake: true, ...diagnostics };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

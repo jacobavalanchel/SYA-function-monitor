@@ -186,19 +186,130 @@ export async function testStagedRuntime(directory, options = {}) {
   fs.appendFileSync(path.join(directory, 'calls.jsonl'), JSON.stringify({
     directory, startupTimeoutMs: options.startupTimeoutMs,
     requestTimeoutMs: options.requestTimeoutMs, stopTimeoutMs: options.stopTimeoutMs,
-    hasSignal: options.signal instanceof AbortSignal,
+    hasSignal: options.signal instanceof AbortSignal, collectStartupTrace: options.collectStartupTrace,
   }) + '\\n');
-  return { runtimeSha256: 'a'.repeat(64), sseHandshake: true, authenticatedOperations: 29 };
+  return { runtimeSha256: 'a'.repeat(64), sseHandshake: true, authenticatedOperations: 29, startupTrace: { status: 'complete' } };
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   console.log(JSON.stringify(await testStagedRuntime(process.argv[2])));
 }
 """)
-            result = builder.verify_http_stage(stage, output, Path(shutil.which("node")).resolve(), snapshot)
+            run = builder.run_bounded
+
+            def collect_before_validation(command, **kwargs):
+                text = run(command, **kwargs)
+                record = json.loads(Path(command[-1]).read_text())
+                self.assertEqual(record["status"], "collected")
+                self.assertEqual(record["invocation"], "original")
+                self.assertEqual(record["expectedRuntimeSha256"], "a" * 64)
+                return text
+
+            with mock.patch.object(builder, "run_bounded", side_effect=collect_before_validation):
+                result = builder.verify_http_stage(stage, output, Path(shutil.which("node")).resolve(), snapshot,
+                                                   invocation="original", expected_stage_digest="a" * 64)
             self.assertEqual(result["authenticatedOperations"], 29)
+            self.assertEqual(result["timeoutScope"], "builder-diagnostic")
+            self.assertEqual(json.loads((output / result["startupEvidenceFile"]).read_text())["status"], "passed")
             calls = [json.loads(line) for line in (stage / "calls.jsonl").read_text().splitlines()]
             self.assertEqual(calls, [{"directory": str(stage), "startupTimeoutMs": 30000,
-                                     "requestTimeoutMs": 1500, "stopTimeoutMs": 2000, "hasSignal": True}])
+                                     "requestTimeoutMs": 1500, "stopTimeoutMs": 2000, "hasSignal": True,
+                                     "collectStartupTrace": True}])
+
+    @unittest.skipUnless(shutil.which("node"), "requires Node for synthetic HTTP wrapper test")
+    def test_http_wrapper_keeps_incomplete_and_failed_startup_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary).resolve()
+            snapshot = output / "snapshot"
+            (snapshot / "scripts").mkdir(parents=True)
+            for status in ("missing", "partial", "invalid"):
+                with self.subTest(status=status):
+                    (snapshot / "scripts/test-staged-runtime.mjs").write_text(
+                        "export async function testStagedRuntime() { return "
+                        + json.dumps({"runtimeSha256": "a" * 64, "sseHandshake": True,
+                                      "authenticatedOperations": 29, "startupTrace": {"status": status}})
+                        + "; }")
+                    with self.assertRaisesRegex(RuntimeError, "trace is not complete"):
+                        builder.verify_http_stage(output, output, Path(shutil.which("node")).resolve(), snapshot,
+                                                  invocation="relocated", expected_stage_digest="a" * 64)
+            records = [json.loads(file.read_text()) for file in output.glob("http-startup-*.json")]
+            self.assertEqual(len(records), 3)
+            self.assertEqual({record["startupTrace"]["status"] for record in records}, {"missing", "partial", "invalid"})
+            self.assertTrue(all(record["status"] == "failed" and record["startupTimeoutMs"] == 30000 for record in records))
+            self.assertTrue(all(record["invocation"] == "relocated" and record["expectedRuntimeSha256"] == "a" * 64 for record in records))
+
+    def test_abrupt_http_wrapper_failure_never_leaves_empty_or_running_json(self):
+        for failure in (RuntimeError("synthetic-wrapper-exit"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary).resolve()
+
+                def terminate(command, **_kwargs):
+                    evidence = Path(command[-1])
+                    self.assertEqual(json.loads(evidence.read_text())["status"], "running")
+                    # Simulate interruption while replacing the wrapper result.
+                    evidence.write_text("")
+                    raise failure
+
+                with mock.patch.object(builder, "run_bounded", side_effect=terminate):
+                    with self.assertRaises(type(failure)):
+                        builder.verify_http_stage(output, output, Path(sys.executable), output,
+                                                  invocation="original", expected_stage_digest="a" * 64)
+                records = [json.loads(file.read_text()) for file in output.glob("http-startup-*.json")]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["status"], "failed")
+                self.assertIsNone(records[0]["startupTrace"])
+                self.assertEqual(records[0]["error"], "HTTP startup wrapper did not complete.")
+                self.assertEqual(records[0]["invocation"], "original")
+                self.assertEqual(records[0]["expectedRuntimeSha256"], "a" * 64)
+
+    def test_rejected_http_result_is_failed_and_keeps_collected_trace(self):
+        trace = {"status": "complete", "stages": [{"stage": "bootstrap", "receiptMs": 1}]}
+        for invalid in ({"runtimeSha256": "b" * 64}, {"runtimeSha256": "invalid"}, {"sseHandshake": False},
+                        {"authenticatedOperations": 0}, {"authenticatedOperations": True}, {"authenticatedOperations": "29"}):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary).resolve()
+                result = {"runtimeSha256": "a" * 64, "sseHandshake": True, "authenticatedOperations": 29,
+                          "startupTrace": trace, **invalid}
+
+                def collect(command, **_kwargs):
+                    evidence = Path(command[-1])
+                    pending = json.loads(evidence.read_text())
+                    evidence.write_text(json.dumps({**pending, "status": "collected", "result": result, "startupTrace": trace}))
+                    return json.dumps(result)
+
+                with mock.patch.object(builder, "run_bounded", side_effect=collect):
+                    with self.assertRaisesRegex(RuntimeError, "native HTTP stage was not verified"):
+                        builder.verify_http_stage(output, output, Path(sys.executable), output,
+                                                  invocation="original", expected_stage_digest="a" * 64)
+                record = json.loads(next(output.glob("http-startup-*.json")).read_text())
+                self.assertEqual(record["status"], "failed")
+                self.assertEqual(record["result"], result)
+                self.assertEqual(record["startupTrace"], trace)
+                self.assertEqual(record["expectedRuntimeSha256"], "a" * 64)
+                self.assertEqual(record["invocation"], "original")
+
+    def test_post_save_http_supervision_failure_keeps_result_and_trace(self):
+        trace = {"status": "partial", "stages": [{"stage": "bootstrap", "receiptMs": 1}]}
+        for failure in (RuntimeError("synthetic supervisor failure"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary).resolve()
+                result = {"runtimeSha256": "a" * 64, "startupTrace": trace}
+
+                def terminate(command, **_kwargs):
+                    evidence = Path(command[-1])
+                    pending = json.loads(evidence.read_text())
+                    evidence.write_text(json.dumps({**pending, "status": "collected", "result": result, "startupTrace": trace}))
+                    raise failure
+
+                with mock.patch.object(builder, "run_bounded", side_effect=terminate):
+                    with self.assertRaises(type(failure)):
+                        builder.verify_http_stage(output, output, Path(sys.executable), output,
+                                                  invocation="relocated", expected_stage_digest="a" * 64)
+                record = json.loads(next(output.glob("http-startup-*.json")).read_text())
+                self.assertEqual(record["status"], "failed")
+                self.assertEqual(record["result"], result)
+                self.assertEqual(record["startupTrace"], trace)
+                self.assertEqual(record["expectedRuntimeSha256"], "a" * 64)
+                self.assertEqual(record["invocation"], "relocated")
 
     @unittest.skipUnless(shutil.which("node"), "requires explicit local Node for actual HTTP mutation test")
     def test_missing_native_server_main_fails_http_despite_self_test_success(self):
@@ -223,7 +334,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
                 shutil.copyfile(ROOT / "packaging/native_tls.py", stage / "native_tls.py")
             self.assertTrue(builder.verify_candidate(executable, output, 10)["ok"])
             with self.assertRaisesRegex(RuntimeError, "startup|exited"):
-                builder.verify_http_stage(stage, output, Path(shutil.which("node")).resolve(), ROOT)
+                builder.verify_http_stage(stage, output, Path(shutil.which("node")).resolve(), ROOT,
+                                          invocation="original", expected_stage_digest="a" * 64)
 
     @unittest.skipUnless(importlib.util.find_spec("PyInstaller") and importlib.util.find_spec("mediapipe"),
                          "requires the actual locked native build environment")

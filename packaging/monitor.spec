@@ -97,7 +97,8 @@ hiddenimports += ["pyrealsense2", "pyrsutils", "PIL.JpegImagePlugin"]
 a = Analysis([str(ROOT / "packaging" / "native_entry.py")],
              pathex=[str(ROOT), str(ROOT / "packaging")], binaries=binaries,
              datas=datas, hiddenimports=hiddenimports, hookspath=[], hooksconfig={},
-             runtime_hooks=[], excludes=[], noarchive=False, optimize=0)
+             runtime_hooks=[str(ROOT / "packaging" / "startup_hook.py")],
+             excludes=[], noarchive=False, optimize=0)
 # PyInstaller 6.22.3 gives SYMLINK a higher TOC priority than BINARY. cv2's
 # bundled OpenSSL aliases can therefore displace the newer interpreter pair,
 # even when the correct libraries were explicitly supplied above. Preserve the

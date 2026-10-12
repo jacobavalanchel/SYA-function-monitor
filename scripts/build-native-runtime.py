@@ -30,11 +30,11 @@ SDK_PINS = {
     "patchSha256": "eb3acdba968cb716133a176a0051af7d06568594cd3b1d8a65f6d3b1202317c1",
 }
 SOURCE_FILES = (
-    "server.py", "realsense_runtime.py", "index.html", "config.example.json",
+    "server.py", "realsense_runtime.py", "startup_trace.py", "index.html", "config.example.json",
     "manifest.json", "module.json", "api.openapi.json", "package.json",
     "packaging/native_entry.py", "packaging/native_self_test.py", "packaging/native_tls.py",
-    "packaging/native_inputs.py", "packaging/monitor.spec",
-    "scripts/build-native-runtime.py", "scripts/test-staged-runtime.mjs", "scripts/hash-runtime.mjs",
+    "packaging/native_inputs.py", "packaging/startup_hook.py", "packaging/monitor.spec",
+    "scripts/build-native-runtime.py", "scripts/test-staged-runtime.mjs", "scripts/hash-runtime.mjs", "scripts/startup-trace.mjs",
 )
 
 
@@ -327,10 +327,14 @@ def verify_candidate(executable, output, timeout):
         return {**result, "externalLaunchToExitMs": process_wall_ms}
 
 
-def verify_http_stage(stage, output, node, snapshot):
+def verify_http_stage(stage, output, node, snapshot, *, invocation, expected_stage_digest):
     """Use the existing contract/auth/proof/SSE smoke on the declared executable."""
+    if invocation not in ("original", "relocated") or not re.fullmatch(r"[0-9a-f]{64}", expected_stage_digest):
+        raise ValueError("Native HTTP evidence requires a fixed invocation and verified stage digest.")
     program = """
+import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
+const pending = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
 const { testStagedRuntime } = await import(pathToFileURL(process.argv[2]).href);
 const abort = new AbortController();
 const stop = () => abort.abort();
@@ -338,27 +342,71 @@ process.once('SIGINT', stop); process.once('SIGTERM', stop);
 try {
   const result = await testStagedRuntime(process.argv[3], {
     startupTimeoutMs: 30000, requestTimeoutMs: 1500, stopTimeoutMs: 2000,
-    signal: abort.signal,
+    signal: abort.signal, collectStartupTrace: true,
   });
+  if (result.startupTrace?.status !== 'complete') {
+    const error = new Error('Native startup trace is not complete.');
+    error.startupTrace = result.startupTrace; throw error;
+  }
+  // Only the supervising Python validator may finalize this as passed.
+  fs.writeFileSync(process.argv[4], JSON.stringify({ ...pending, status: 'collected', startupTrace: result.startupTrace, result }, null, 2));
   console.log(JSON.stringify(result));
-} catch (error) { console.error(error.message); process.exitCode = 1; }
+} catch (error) {
+  fs.writeFileSync(process.argv[4], JSON.stringify({ ...pending, status: 'failed', error: error.message, startupTrace: error.startupTrace ?? null }, null, 2));
+  console.error(error.message); process.exitCode = 1;
+}
 finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
 """
     with tempfile.TemporaryDirectory(prefix="native-http-test-", dir=output) as scratch:
         scratch = Path(scratch)
         env = isolated_environment(scratch / "home", scratch / "tmp")
         started = time.monotonic()
+        # Preserve each invocation independently, including incomplete traces
+        # and failures; relocation must not overwrite original-start evidence.
+        descriptor, evidence_path = tempfile.mkstemp(prefix="http-startup-", suffix=".json", dir=output)
+        binding = {"invocation": invocation, "expectedRuntimeSha256": expected_stage_digest,
+                   "timeoutScope": "builder-diagnostic", "startupTimeoutMs": 30000}
+        pending = {**binding, "status": "running", "startupTrace": None}
+        with os.fdopen(descriptor, "w", encoding="utf-8") as evidence:
+            json.dump(pending, evidence)
         # Keep argv[1] distinct from the imported helper: its CLI guard must
         # remain false when this wrapper calls the exported function once.
-        text = run_bounded([str(node), "--input-type=module", "-e", program, "sya-native-http-wrapper",
-                            str(snapshot / "scripts/test-staged-runtime.mjs"), str(stage)],
-                           env=env, cwd=scratch, timeout=180)
-        result = json.loads(text)
-        if (not re.fullmatch(r"[0-9a-f]{64}", str(result.get("runtimeSha256", ""))) or
-                result.get("sseHandshake") is not True or result.get("authenticatedOperations", 0) < 1):
-            raise RuntimeError("The native HTTP stage was not verified.")
+        failure_message = "HTTP startup wrapper did not complete."
+        try:
+            text = run_bounded([str(node), "--input-type=module", "-e", program, "sya-native-http-wrapper",
+                                str(snapshot / "scripts/test-staged-runtime.mjs"), str(stage), evidence_path],
+                               env=env, cwd=scratch, timeout=180)
+            failure_message = "The native HTTP stage was not verified."
+            result = json.loads(text)
+            if (not isinstance(result, dict) or result.get("runtimeSha256") != expected_stage_digest
+                    or result.get("sseHandshake") is not True
+                    or type(result.get("authenticatedOperations")) is not int or result["authenticatedOperations"] < 1
+                    or not isinstance(result.get("startupTrace"), dict)
+                    or result["startupTrace"].get("status") != "complete"):
+                raise RuntimeError(failure_message)
+            Path(evidence_path).write_text(json.dumps({**binding, "status": "passed",
+                "startupTrace": result["startupTrace"], "result": result}) + "\n", encoding="utf-8")
+        except BaseException:
+            # The wrapper normally persists its sanitized failure after cleanup.
+            # Abrupt termination/import failure must still leave readable failed
+            # evidence, without claiming an unavailable partial trace exists.
+            try:
+                try:
+                    record = json.loads(Path(evidence_path).read_text())
+                except (OSError, ValueError):
+                    record = pending
+                if not isinstance(record, dict):
+                    record = pending
+                # Keep any collected result/trace when supervision or Python
+                # validation fails, and retain the helper-owned identity fields.
+                Path(evidence_path).write_text(json.dumps({**pending, **record, **binding, "status": "failed",
+                    "error": record.get("error") or failure_message}) + "\n", encoding="utf-8")
+            except OSError:
+                pass  # Do not replace the original startup/interruption failure.
+            raise
         return {**result, "externalHttpValidationWallMs": round((time.monotonic() - started) * 1000),
-                "startupTimeoutMs": 30000, "stopTimeoutMs": 2000}
+                "startupTimeoutMs": 30000, "timeoutScope": "builder-diagnostic", "stopTimeoutMs": 2000,
+                "startupEvidenceFile": Path(evidence_path).name}
 
 
 def stage_digest(stage, output, node, snapshot):
@@ -407,14 +455,15 @@ def build(args):
         raise RuntimeError("PyInstaller did not produce the expected native executable.")
     initial_stage_digest = stage_digest(stage, output, node, snapshot)
     self_test = verify_candidate(executable, output, args.self_test_timeout)
-    http_test = verify_http_stage(stage, output, node, snapshot)
+    http_test = verify_http_stage(stage, output, node, snapshot, invocation="original", expected_stage_digest=initial_stage_digest)
     if http_test["runtimeSha256"] != initial_stage_digest:
         raise RuntimeError("Native stage changed during dependency validation.")
     with tempfile.TemporaryDirectory(prefix="中文 路径 ", dir=output) as relocated:
         relocated_stage = Path(relocated) / "stage"
         shutil.copytree(stage, relocated_stage)
         relocated_test = verify_candidate(relocated_stage / "bin" / "monitor-server", output, args.self_test_timeout)
-        relocated_http = verify_http_stage(relocated_stage, output, node, snapshot)
+        relocated_http = verify_http_stage(relocated_stage, output, node, snapshot,
+                                           invocation="relocated", expected_stage_digest=initial_stage_digest)
         if relocated_http["runtimeSha256"] != http_test["runtimeSha256"]:
             raise RuntimeError("Relocated native stage differs from the verified original stage.")
     # Bind only inputs that remained unchanged through actual frozen validation.

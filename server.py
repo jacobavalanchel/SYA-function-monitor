@@ -1882,8 +1882,13 @@ class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
 
 def main(shutdown_timeout=8.0):
     """Serve until interrupted, then release only resources already acquired."""
+    trace = lambda _stage: None
+    if getattr(sys, "frozen", False):
+        from startup_trace import emit as trace
+    trace("config_start")
     port = resolve_port()
     api_config = load_api_config()
+    trace("config_complete")
     stopping = False
 
     def request_stop(_signal, _frame):
@@ -1893,7 +1898,9 @@ def main(shutdown_timeout=8.0):
         stopping = True
 
     previous_handlers = {}
+    trace("bind_start")
     with ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler) as httpd:
+        trace("bind_complete")
         httpd.daemon_threads = True
         httpd.timeout = 0.25
         print(f"Serving on http://127.0.0.1:{port}")
@@ -1908,6 +1915,7 @@ def main(shutdown_timeout=8.0):
         try:
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous_handlers[signum] = signal.signal(signum, request_stop)
+            trace("loop_ready")
             while not stopping:
                 httpd.handle_request()
         finally:

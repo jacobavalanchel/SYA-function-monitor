@@ -1,17 +1,26 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import childProcess, { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { testStagedRuntime } from '../scripts/test-staged-runtime.mjs';
 import { runtimeTreeSha256 } from '../scripts/hash-runtime.mjs';
+import './test_startup_trace.mjs';
 
 const cli = fileURLToPath(new URL('../scripts/test-staged-runtime.mjs', import.meta.url));
 const settings = { startupTimeoutMs: 1200, requestTimeoutMs: 250, stopTimeoutMs: 150 };
 const paths = ['/health', '/manifest', '/api/monitor/actions', '/api/monitor/screen/status', '/api/monitor/realsense/frame/latest'];
+const startupStages = [
+  'bootstrap', 'entry', 'entry_imports_complete', 'freeze_support_complete',
+  'tls_start', 'tls_complete', 'server_import_start', 'server_import_complete',
+  'config_start', 'config_complete', 'bind_start', 'bind_complete', 'loop_ready',
+];
 const runtime = String.raw`
 const fs = require('node:fs'), path = require('node:path'), http = require('node:http');
 const { createHmac } = require('node:crypto');
@@ -26,7 +35,21 @@ const details = { pid: process.pid, home: process.env.HOME, records: process.env
 fs.writeFileSync(path.join(witness, 'process.json'), JSON.stringify(details));
 const record = value => fs.appendFileSync(path.join(witness, 'calls.jsonl'), JSON.stringify(value) + '\n');
 const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
-if (mode === 'bad-startup') { console.error('DO-NOT-PRINT-RUNTIME-LOG'); process.exit(7); }
+if (mode.startsWith('trace-')) {
+  const stages = ${JSON.stringify(startupStages)};
+  const count = ['trace-exit', 'trace-hang', 'trace-signal'].includes(mode) ? 2 : stages.length;
+  for (let index = 0; index < count; index++) {
+    fs.writeSync(2, '[sya-startup-v1] ' + stages[index] + ' ' + (9007199254740993000n + BigInt(index) * 250000n) + '\n');
+  }
+  if (mode === 'trace-malformed') {
+    fs.writeSync(2, 'PRIVATE-STARTUP-LOG /private/runtime/config\n');
+    fs.writeSync(2, '[sya-startup-v1] private_stage 1\n');
+    fs.writeSync(2, '[sya-startup-v1] entry ' + 'PRIVATE-STARTUP-LOG'.repeat(200) + '\n');
+  }
+  fs.writeFileSync(path.join(witness, 'trace-emitted'), 'emitted');
+}
+if (mode === 'bad-startup' || mode === 'trace-exit') { console.error('DO-NOT-PRINT-RUNTIME-LOG'); process.exit(7); }
+if (mode === 'trace-signal') process.kill(process.pid, 'SIGKILL');
 if (mode === 'resist') {
   const worker = spawn(process.execPath, ['-e', 'process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'], { stdio: 'ignore' });
   fs.writeFileSync(path.join(witness, 'worker-pid'), String(worker.pid));
@@ -37,7 +60,7 @@ if (mode === 'resist') {
     setTimeout(() => process.exit(0), 20);
   });
 }
-if (mode === 'hang-startup') { setInterval(() => {}, 1000); }
+if (mode === 'hang-startup' || mode === 'trace-hang') { setInterval(() => {}, 1000); }
 else http.createServer((req, res) => {
   const authorized = req.headers.authorization === 'Bearer ' + process.env.FUNCTION_RUNTIME_TOKEN;
   record({ method: req.method, url: req.url, authorized });
@@ -51,7 +74,12 @@ else http.createServer((req, res) => {
   if (req.url === '/health') {
     if (mode === 'mutate') fs.writeFileSync(path.join(process.cwd(), 'modified-by-runtime'), 'changed');
     if (mode !== 'missing-proof') res.setHeader('X-SYA-Runtime-Proof',
-      createHmac('sha256', mode === 'wrong-proof' ? 'wrong-key' : process.env.FUNCTION_RUNTIME_PROOF_KEY).update('sya-runtime-v1').digest('hex'));
+      createHmac('sha256', ['wrong-proof', 'trace-wrong-proof'].includes(mode) ? 'wrong-key' : process.env.FUNCTION_RUNTIME_PROOF_KEY).update('sya-runtime-v1').digest('hex'));
+    if (mode === 'trace-delayed-body') {
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.flushHeaders();
+      setTimeout(() => res.end(JSON.stringify({ ok: true, data: { status: 'ok', functionId: 'monitor', version } })), 80);
+      return;
+    }
     return json(res, 200, { ok: true, data: { status: 'ok', functionId: 'monitor', version: mode === 'wrong-identity' ? 'wrong' : version } });
   }
   if (req.url === '/manifest') return json(res, 200, { ok: true, data: { id: 'monitor', version, runtime: 'local-http' } });
@@ -141,6 +169,314 @@ function checkCleanup(witness) {
   return details;
 }
 
+function checkTraceLifecycle(trace, ready = false) {
+  assert.equal(trace.finished, true);
+  assert.equal(trace.hostTimings.clock, 'node-hrtime-from-spawn-before');
+  assert.equal(trace.hostTimings.startupTimeoutMs, settings.startupTimeoutMs);
+  assert.equal(trace.hostTimings.spawnBeforeMs, 0);
+  assert.equal(trace.lifecycle.spawn, 'spawned');
+  assert.equal(trace.lifecycle.spawnErrorCode, null);
+  assert.equal(trace.lifecycle.close, 'closed');
+  const keys = ['spawnBeforeMs', 'spawnReturnMs', 'spawnEventMs',
+    ...(ready ? ['firstHealthHeadersMs', 'firstSuccessfulHealthHeadersMs',
+      'firstHealthBodyCompleteMs', 'firstSuccessfulHealthBodyCompleteMs', 'authenticatedReadyMs'] : []),
+    'exitMs', 'closeMs'];
+  for (const [index, key] of keys.entries()) {
+    assert.ok(Number.isFinite(trace.hostTimings[key]), `finite ${key}`);
+    assert.ok(trace.hostTimings[key] >= 0, `nonnegative ${key}`);
+    if (index > 0) assert.ok(trace.hostTimings[key] >= trace.hostTimings[keys[index - 1]], `ordered ${key}`);
+  }
+  for (const stage of trace.stages) {
+    assert.ok(stage.receiptMs >= trace.hostTimings.spawnBeforeMs);
+    assert.ok(stage.receiptMs <= trace.hostTimings.closeMs);
+  }
+}
+
+function mockSpawn(t, replacement) {
+  const original = childProcess.spawn;
+  childProcess.spawn = (...args) => replacement(original, ...args);
+  syncBuiltinESMExports();
+  t.after(() => { childProcess.spawn = original; syncBuiltinESMExports(); });
+}
+
+test('optional startup diagnostics collect a complete trace without weakening authenticated smoke', async t => {
+  const { directory, witness } = fixture(t, 'trace-complete');
+  const before = runtimeTreeSha256(directory);
+  const result = await testStagedRuntime(directory, { ...settings, collectStartupTrace: true });
+  assert.equal(result.runtimeSha256, before);
+  assert.equal(runtimeTreeSha256(directory), before);
+  assert.equal(result.authenticatedOperations, 16);
+  assert.equal(result.sseHandshake, true);
+  assert.deepEqual(result.successfulGetPaths, paths);
+  const trace = result.startupTrace;
+  assert.equal(trace.status, 'complete');
+  assert.deepEqual(trace.reasonCodes, []);
+  assert.deepEqual(trace.missingStages, []);
+  assert.deepEqual(trace.stages.map(stage => stage.stage), startupStages);
+  assert.equal(trace.stages[0].pythonMonotonicNs, '9007199254740993000');
+  assert.equal(trace.stages[0].pythonElapsedMs, 0);
+  assert.equal(trace.stages[1].pythonDeltaMs, 0.25);
+  assert.equal(trace.stages.at(-1).pythonElapsedMs, 3);
+  assert.deepEqual(trace.lifecycle, { outcome: 'passed', spawn: 'spawned', spawnErrorCode: null,
+    exitCode: 0, signalCode: null, closeCode: 0, closeSignal: null, close: 'closed' });
+  checkTraceLifecycle(trace, true);
+  checkCleanup(witness);
+  assert.equal(fs.existsSync(path.join(witness, 'stream-closed')), true);
+  const calls = fs.readFileSync(path.join(witness, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(calls.filter(call => !call.authorized).length, 32);
+});
+
+test('old runtimes remain compatible and report missing when diagnostics are requested', async t => {
+  const { directory, witness } = fixture(t);
+  const result = await testStagedRuntime(directory, { ...settings, collectStartupTrace: true });
+  assert.equal(result.startupTrace.status, 'missing');
+  assert.deepEqual(result.startupTrace.stages, []);
+  assert.deepEqual(result.startupTrace.reasonCodes, []);
+  assert.deepEqual(result.startupTrace.missingStages, startupStages);
+  checkTraceLifecycle(result.startupTrace, true);
+  checkCleanup(witness);
+});
+
+for (const [mode, expected] of [['trace-exit', /exited before/], ['trace-hang', /startup timed out/], ['trace-signal', /exited before/]]) {
+  test(`startup diagnostics retain a partial prefix for ${mode} and clean the owned process`, async t => {
+    const { directory, witness } = fixture(t, mode);
+    await assert.rejects(testStagedRuntime(directory, { ...settings, collectStartupTrace: true }), error => {
+      assert.match(error.message, expected);
+      assert.equal(error.startupTrace.status, 'partial');
+      assert.deepEqual(error.startupTrace.stages.map(stage => stage.stage), startupStages.slice(0, 2));
+      assert.deepEqual(error.startupTrace.missingStages, startupStages.slice(2));
+      assert.deepEqual(error.startupTrace.reasonCodes, []);
+      assert.equal(error.startupTrace.hostTimings.firstHealthHeadersMs, undefined);
+      assert.equal(error.startupTrace.hostTimings.firstHealthBodyCompleteMs, undefined);
+      assert.equal(error.startupTrace.hostTimings.authenticatedReadyMs, undefined);
+      assert.equal(error.startupTrace.lifecycle.outcome, mode === 'trace-hang' ? 'startup_timeout' : 'runtime_exit');
+      assert.equal(error.startupTrace.lifecycle.exitCode, mode === 'trace-signal' ? null : mode === 'trace-exit' ? 7 : 0);
+      assert.equal(error.startupTrace.lifecycle.closeCode, error.startupTrace.lifecycle.exitCode);
+      assert.equal(error.startupTrace.lifecycle.signalCode, mode === 'trace-signal' ? 'SIGKILL' : null);
+      assert.equal(error.startupTrace.lifecycle.closeSignal, error.startupTrace.lifecycle.signalCode);
+      checkTraceLifecycle(error.startupTrace);
+      assert.equal(JSON.stringify(error).includes('DO-NOT-PRINT-RUNTIME-LOG'), false);
+      assert.equal(error.message.includes('DO-NOT-PRINT-RUNTIME-LOG'), false);
+      return true;
+    });
+    checkCleanup(witness);
+  });
+}
+
+test('state removal failure preserves the startup failure and partial trace without exposing exception text', async t => {
+  const { directory, witness } = fixture(t, 'trace-exit');
+  const remove = fs.rmSync;
+  let retainedState;
+  fs.rmSync = (target, options) => {
+    if (typeof target === 'string' && path.basename(target).startsWith('monitor-staged-smoke-')) {
+      retainedState = target;
+      throw new Error('PRIVATE-CLEANUP-EXCEPTION /private/config');
+    }
+    return remove(target, options);
+  };
+  try {
+    await assert.rejects(testStagedRuntime(directory, { ...settings, collectStartupTrace: true }), error => {
+      assert.match(error.message, /exited before authenticated startup completed/);
+      assert.match(error.message, /Isolated smoke state could not be removed/);
+      assert.equal(error.startupTrace.status, 'partial');
+      assert.deepEqual(error.startupTrace.stages.map(stage => stage.stage), startupStages.slice(0, 2));
+      assert.deepEqual(error.startupTrace.reasonCodes, []);
+      checkTraceLifecycle(error.startupTrace);
+      for (const privateText of ['PRIVATE-CLEANUP-EXCEPTION', '/private/config']) {
+        assert.equal(error.message.includes(privateText), false);
+        assert.equal(JSON.stringify(error).includes(privateText), false);
+      }
+      return true;
+    });
+    assert.equal(typeof retainedState, 'string');
+    assert.equal(fs.existsSync(retainedState), true, 'injected removal failure must leave isolated state');
+    const details = JSON.parse(fs.readFileSync(path.join(witness, 'process.json')));
+    assert.equal(exists(details.pid), false, 'process cleanup still completes before state removal fails');
+    assert.equal(path.dirname(details.home), retainedState, 'remove only this fixture owned state');
+  } finally {
+    fs.rmSync = remove;
+    if (retainedState) remove(retainedState, { recursive: true, force: true });
+  }
+  checkCleanup(witness);
+});
+
+test('abort retains collected startup stages and the interruption error after cleanup', async t => {
+  const { directory, witness } = fixture(t, 'trace-hang');
+  const controller = new AbortController();
+  const run = testStagedRuntime(directory, { ...settings, collectStartupTrace: true, signal: controller.signal });
+  const rejected = assert.rejects(run, error => {
+    assert.match(error.message, /interrupted/);
+    assert.equal(error.startupTrace.status, 'partial');
+    assert.deepEqual(error.startupTrace.stages.map(stage => stage.stage), startupStages.slice(0, 2));
+    assert.equal(error.startupTrace.hostTimings.authenticatedReadyMs, undefined);
+    assert.equal(error.startupTrace.lifecycle.outcome, 'interrupted');
+    checkTraceLifecycle(error.startupTrace);
+    return true;
+  });
+  for (let tries = 0; tries < 100 && !fs.existsSync(path.join(witness, 'trace-emitted')); tries++) await delay(10);
+  const emitted = fs.existsSync(path.join(witness, 'trace-emitted'));
+  controller.abort();
+  await rejected;
+  assert.equal(emitted, true);
+  checkCleanup(witness);
+});
+
+test('a successful health response remains distinct from proof-verified readiness in failure diagnostics', async t => {
+  const { directory, witness } = fixture(t, 'trace-wrong-proof');
+  await assert.rejects(testStagedRuntime(directory, { ...settings, collectStartupTrace: true }), error => {
+    assert.match(error.message, /spawned-process identity/);
+    assert.equal(error.startupTrace.status, 'complete');
+    const timings = error.startupTrace.hostTimings;
+    assert.ok(Number.isFinite(timings.firstHealthHeadersMs));
+    assert.ok(timings.firstSuccessfulHealthHeadersMs >= timings.firstHealthHeadersMs);
+    assert.ok(timings.firstHealthBodyCompleteMs >= timings.firstSuccessfulHealthHeadersMs);
+    assert.ok(timings.firstSuccessfulHealthBodyCompleteMs >= timings.firstHealthBodyCompleteMs);
+    assert.equal(timings.authenticatedReadyMs, undefined);
+    assert.equal(error.startupTrace.lifecycle.outcome, 'validation_failed');
+    checkTraceLifecycle(error.startupTrace);
+    return true;
+  });
+  checkCleanup(witness);
+});
+
+test('health headers arrive before a deliberately delayed body and proof readiness', async t => {
+  const { directory, witness } = fixture(t, 'trace-delayed-body');
+  const { startupTrace: trace } = await testStagedRuntime(directory, { ...settings, collectStartupTrace: true });
+  checkTraceLifecycle(trace, true);
+  const timings = trace.hostTimings;
+  assert.ok(timings.firstHealthBodyCompleteMs - timings.firstHealthHeadersMs >= 40);
+  assert.ok(timings.firstSuccessfulHealthBodyCompleteMs - timings.firstSuccessfulHealthHeadersMs >= 40);
+  assert.ok(timings.authenticatedReadyMs >= timings.firstSuccessfulHealthBodyCompleteMs);
+  assert.equal(trace.lifecycle.outcome, 'passed');
+  checkCleanup(witness);
+});
+
+test('collector waits for delayed close and keeps trailing markers after real child exit', async t => {
+  const { directory, witness } = fixture(t, 'trace-exit');
+  let timer;
+  t.after(() => clearTimeout(timer));
+  mockSpawn(t, (original, ...args) => {
+    const child = original(...args);
+    const emit = child.emit;
+    child.emit = function (event, ...values) {
+      if (event !== 'close') return emit.call(this, event, ...values);
+      timer = setTimeout(() => {
+        const trailing = startupStages.slice(2).map((stage, offset) =>
+          `[sya-startup-v1] ${stage} ${9007199254740993000n + BigInt(offset + 2) * 250000n}\n`).join('');
+        child.stderr.emit('data', Buffer.from(trailing));
+        emit.call(child, event, ...values);
+      }, 80);
+      return true;
+    };
+    return child;
+  });
+  await assert.rejects(testStagedRuntime(directory, { ...settings, collectStartupTrace: true }), error => {
+    assert.match(error.message, /exited before/);
+    const trace = error.startupTrace;
+    assert.equal(trace.status, 'complete');
+    assert.deepEqual(trace.stages.map(stage => stage.stage), startupStages);
+    assert.ok(trace.stages.at(-1).receiptMs > trace.hostTimings.exitMs);
+    assert.ok(trace.hostTimings.closeMs - trace.hostTimings.exitMs >= 40);
+    assert.equal(trace.lifecycle.outcome, 'runtime_exit');
+    assert.equal(trace.lifecycle.exitCode, 7);
+    assert.equal(trace.lifecycle.closeCode, 7);
+    checkTraceLifecycle(trace);
+    return true;
+  });
+  checkCleanup(witness);
+});
+
+test('a close timeout fails completed smoke, destroys stderr and freezes diagnostic state', async t => {
+  const { directory, witness } = fixture(t, 'trace-complete');
+  let child, emit, destroys = 0, destroysAtClose;
+  mockSpawn(t, (original, ...args) => {
+    child = original(...args);
+    emit = child.emit;
+    const destroy = child.stderr.destroy;
+    child.stderr.destroy = function (...values) { destroys += 1; return destroy.apply(this, values); };
+    child.emit = function (event, ...values) {
+      if (event === 'close') { destroysAtClose = destroys; return true; }
+      return emit.call(this, event, ...values);
+    };
+    return child;
+  });
+  await assert.rejects(testStagedRuntime(directory, { ...settings, collectStartupTrace: true }), error => {
+    assert.match(error.message, /stdio did not close within the cleanup deadline/);
+    const trace = error.startupTrace;
+    assert.equal(trace.status, 'complete');
+    assert.equal(trace.finished, true);
+    assert.equal(trace.lifecycle.outcome, 'cleanup_failed');
+    assert.equal(trace.lifecycle.close, 'timeout');
+    assert.equal(trace.lifecycle.exitCode, 0);
+    assert.equal(trace.lifecycle.closeCode, null);
+    assert.equal(trace.hostTimings.closeMs, undefined);
+    assert.ok(Number.isFinite(trace.hostTimings.authenticatedReadyMs));
+    assert.ok(destroys > destroysAtClose);
+    assert.equal(child.stderr.destroyed, true);
+    const snapshot = JSON.stringify(trace);
+    emit.call(child, 'close', 0, null);
+    assert.equal(JSON.stringify(trace), snapshot, 'late close cannot rewrite returned evidence');
+    return true;
+  });
+  checkCleanup(witness);
+});
+
+for (const style of ['sync', 'async']) {
+  for (const code of ['ENOENT', 'PRIVATE-SPAWN-CODE']) {
+    test(`${style} spawn failure keeps only sanitized lifecycle codes (${code === 'ENOENT' ? 'known' : 'unknown'})`, async t => {
+      const { directory, witness } = fixture(t);
+      let state;
+      mockSpawn(t, (_original, _file, _args, options) => {
+        state = path.dirname(options.env.HOME);
+        const error = Object.assign(new Error('PRIVATE-SPAWN-DETAIL /private/config'), { code });
+        if (style === 'sync') throw error;
+        const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, stderr: new PassThrough() });
+        setImmediate(() => {
+          child.emit('error', error);
+          child.stderr.end();
+          child.emit('close', -2, null);
+        });
+        return child;
+      });
+      await assert.rejects(testStagedRuntime(directory, { ...settings, collectStartupTrace: true }), error => {
+        const trace = error.startupTrace;
+        assert.equal(trace.status, 'missing');
+        assert.equal(trace.finished, true);
+        assert.equal(trace.lifecycle.outcome, 'spawn_error');
+        assert.equal(trace.lifecycle.spawn, 'error');
+        assert.equal(trace.lifecycle.spawnErrorCode, code === 'ENOENT' ? 'ENOENT' : 'OTHER');
+        assert.equal(trace.lifecycle.exitCode, null);
+        assert.equal(trace.lifecycle.signalCode, null);
+        assert.equal(trace.lifecycle.close, style === 'sync' ? 'not_started' : 'closed');
+        assert.equal(trace.lifecycle.closeCode, style === 'sync' ? null : -2);
+        assert.ok(Number.isFinite(trace.hostTimings.errorMs));
+        assert.equal(trace.hostTimings.spawnEventMs, undefined);
+        assert.equal(trace.hostTimings.authenticatedReadyMs, undefined);
+        assert.equal((error.message + JSON.stringify(trace)).includes('PRIVATE'), false);
+        assert.equal((error.message + JSON.stringify(trace)).includes('/private'), false);
+        return true;
+      });
+      assert.equal(fs.existsSync(state), false);
+      assert.equal(fs.existsSync(path.join(witness, 'process.json')), false);
+    });
+  }
+}
+
+test('malformed and oversize startup markers remain bounded invalid diagnostics without private logs', async t => {
+  const { directory, witness } = fixture(t, 'trace-malformed');
+  const result = await testStagedRuntime(directory, { ...settings, collectStartupTrace: true });
+  const trace = result.startupTrace;
+  assert.equal(result.sseHandshake, true);
+  assert.equal(trace.status, 'invalid');
+  assert.equal(trace.stages.length, startupStages.length);
+  assert.deepEqual(trace.reasonCodes, ['unknown_stage', 'marker_too_long']);
+  const serialized = JSON.stringify(trace);
+  assert.ok(serialized.length < 4000);
+  for (const secret of ['PRIVATE-STARTUP-LOG', '/private/runtime/config', 'private_stage']) assert.equal(serialized.includes(secret), false);
+  checkTraceLifecycle(trace, true);
+  checkCleanup(witness);
+});
+
 test('stage smoke proves identity, denies every method, cancels SSE, preserves bytes and isolates environment', async t => {
   const { directory, witness } = fixture(t);
   const before = runtimeTreeSha256(directory);
@@ -151,6 +487,7 @@ test('stage smoke proves identity, denies every method, cancels SSE, preserves b
   finally { if (prior === undefined) delete process.env.STAGED_SMOKE_SECRET; else process.env.STAGED_SMOKE_SECRET = prior; }
   assert.equal(result.runtimeSha256, before); assert.equal(runtimeTreeSha256(directory), before);
   assert.equal(result.authenticatedOperations, 16); assert.deepEqual(result.successfulGetPaths, paths);
+  assert.equal(Object.hasOwn(result, 'startupTrace'), false, 'diagnostics remain opt-in');
   const details = checkCleanup(witness);
   assert.equal(details.envKeys.includes('STAGED_SMOKE_SECRET'), false);
   const unexpectedKeys = details.envKeys.filter(key => !['PATH', 'MONITOR_PYTHON', 'HOME', 'MONITOR_CONFIG_PATH', 'MONITOR_RECORDS_DIR', 'TMPDIR', 'TMP', 'TEMP', 'PORT', 'FUNCTION_RUNTIME_TOKEN', 'FUNCTION_RUNTIME_PROOF_KEY', 'PYTHONDONTWRITEBYTECODE'].includes(key));

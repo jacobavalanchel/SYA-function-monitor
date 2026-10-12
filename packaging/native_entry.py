@@ -1,20 +1,33 @@
 """Native provider entry point; diagnostics never import the HTTP service."""
 
+import sys
+
+if getattr(sys, "frozen", False):
+    from startup_trace import emit
+else:
+    def emit(_stage):
+        pass
+
+emit("entry")
 import json
 import multiprocessing
 from pathlib import Path
-import sys
+
+emit("entry_imports_complete")
 
 
 def initialize_tls():
+    emit("tls_start")
     if getattr(sys, "frozen", False):
         from native_tls import configure_native_tls
 
         configure_native_tls()
+    emit("tls_complete")
 
 
 def main():
     multiprocessing.freeze_support()
+    emit("freeze_support_complete")
     if not getattr(sys, "frozen", False):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     if sys.argv[1:] == ["--self-test"]:
@@ -34,8 +47,10 @@ def main():
         print("--self-test takes no additional arguments.", file=sys.stderr)
         return 2
     initialize_tls()
+    emit("server_import_start")
     import server
 
+    emit("server_import_complete")
     server.main()
     return 0
 
