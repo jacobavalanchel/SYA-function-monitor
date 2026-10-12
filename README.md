@@ -561,3 +561,11 @@ restrictions. The browser never receives the API key.
 - Chrome browser with webcam access
 - Internet access for MediaPipe CDN/model loading
 - LLM endpoint access only if screen reading is enabled
+
+## 本机自包含候选与第三方依赖
+
+macOS arm64 的本机原型入口、完整依赖锁、合成诊断与发布边界见 [packaging/README.md](packaging/README.md)。该候选不替换生产 artifact，也不证明硬件、签名或最低系统版本已通过。Browser demo 与 Python FaceMesh 使用不同模型资产，不能互相替代验收。
+
+### 第三方依赖与许可证
+
+原型采用 PyInstaller（GPLv2+，含商业 bundle 例外）、MediaPipe/librealsense（Apache-2.0）、NumPy（BSD）、Pillow（MIT-CMU）、libusb（LGPL-2.1）及完整锁定的传递依赖；证书库使用 certifi（MPL-2.0）。具体固定版本、官方来源和已知分发问题见 [依赖说明](packaging/dependency-notes.md)。正式分发前仍须归档完整 LICENSE/NOTICE 及 libusb 对应来源/适用材料，本页不作为许可证合规完成证明。

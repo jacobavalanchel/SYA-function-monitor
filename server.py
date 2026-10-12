@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import socketserver
 import subprocess
 import sys
@@ -176,6 +177,7 @@ class RealSenseAdapter:
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
         self.lifecycle_lock = threading.Lock()
+        self._shutting_down = False
         self.frame_condition = threading.Condition(self.lock)
         self.stream_config = {
             "width": 640,
@@ -825,6 +827,8 @@ class RealSenseAdapter:
 
     def _start(self, payload=None):
         with self.lock:
+            if self._shutting_down:
+                raise RuntimeError("RealSense runtime is shutting down.")
             if self.active:
                 return self.status()
 
@@ -1001,7 +1005,15 @@ class RealSenseAdapter:
         with self.lifecycle_lock:
             return self._stop(_payload)
 
-    def _stop(self, _payload=None):
+    def shutdown(self):
+        """Release held resources without discovering devices or reading config."""
+        with self.lock:
+            self._shutting_down = True
+            self.stop_event.set()
+        with self.lifecycle_lock:
+            return self._stop(include_status=False)
+
+    def _stop(self, _payload=None, *, include_status=True):
         with self.lock:
             pipeline = self.pipeline
             worker = self.worker
@@ -1029,7 +1041,7 @@ class RealSenseAdapter:
                     self.active = True
                     CAMERA_STATE["isActive"] = True
                     self._publish_access_boundary("session-stop", "REALSENSE_STOP_FAILED")
-                return self.status()
+                return self.status() if include_status else False
         if stop_failed:
             # The SDK may still own the camera. The host must not treat this as
             # stopped; retain the handle for retry or terminate the runtime.
@@ -1037,11 +1049,13 @@ class RealSenseAdapter:
                 self.active = True
                 CAMERA_STATE["isActive"] = True
                 self._publish_access_boundary("session-stop", "REALSENSE_STOP_FAILED")
-            return self.status()
+            return self.status() if include_status else False
+        detector_close_failed = False
         if detector:
             try:
                 detector.close()
             except Exception as error:
+                detector_close_failed = True
                 if not self.last_error:
                     self.last_error = f"Failed to release focus inference: {error}"
 
@@ -1049,7 +1063,7 @@ class RealSenseAdapter:
             self.pipeline = None
             self.profile = None
             self.worker = None
-            self.focus_detector = None
+            self.focus_detector = detector if detector_close_failed else None
             self.depth_scale = None
             self.latest_frame_data = None
             self.latest_raw_frame = None
@@ -1062,7 +1076,7 @@ class RealSenseAdapter:
             if was_active:
                 self._publish_access_boundary("session-stop", "REALSENSE_STOPPED")
 
-        return self.status()
+        return self.status() if include_status else not detector_close_failed
 
     def _depth_scale(self):
         return self.depth_scale
@@ -1866,11 +1880,22 @@ class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
-if __name__ == "__main__":
+def main(shutdown_timeout=8.0):
+    """Serve until interrupted, then release only resources already acquired."""
     port = resolve_port()
     api_config = load_api_config()
+    stopping = False
+
+    def request_stop(_signal, _frame):
+        # Raising asynchronously can interrupt a lock operation. A finite HTTP
+        # poll observes this flag without running cleanup in a signal handler.
+        nonlocal stopping
+        stopping = True
+
+    previous_handlers = {}
     with ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler) as httpd:
         httpd.daemon_threads = True
+        httpd.timeout = 0.25
         print(f"Serving on http://127.0.0.1:{port}")
         print(f"Static files from: {STATIC_DIR}")
         print("Health at: GET /health")
@@ -1881,6 +1906,28 @@ if __name__ == "__main__":
         else:
             print("API config: missing; copy config.example.json to config.local.json")
         try:
-            httpd.serve_forever()
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[signum] = signal.signal(signum, request_stop)
+            while not stopping:
+                httpd.handle_request()
         finally:
-            REALSENSE.stop()
+            stopped = []
+
+            def release_resources():
+                try:
+                    stopped.append(REALSENSE.shutdown())
+                except Exception:
+                    stopped.append(False)
+
+            cleanup = threading.Thread(target=release_resources, daemon=True,
+                                       name="monitor-shutdown")
+            cleanup.start()
+            cleanup.join(timeout=shutdown_timeout)
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+            if cleanup.is_alive() or stopped != [True]:
+                raise RuntimeError("Monitor shutdown did not finish cleanly within its deadline.")
+
+
+if __name__ == "__main__":
+    main()

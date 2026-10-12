@@ -1,0 +1,530 @@
+"""Failure boundaries for native packaging; real inference is a separate gate."""
+
+import contextlib
+import ast
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import signal
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest
+import urllib.error
+import urllib.request
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+
+def load(name, relative):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+builder = load("native_builder_tests", "scripts/build-native-runtime.py")
+entry = load("native_entry_tests", "packaging/native_entry.py")
+self_test = load("native_self_test_tests", "packaging/native_self_test.py")
+server = load("native_server_tests", "server.py")
+
+
+class NativeBuildBoundaryTests(unittest.TestCase):
+    def resistant_child_command(self, root, *, exit_leader=False):
+        witness = root / "owned-pids.json"
+        code = (
+            "import json,os,pathlib,signal,sys,time\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            " signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            " pathlib.Path(sys.argv[1] + '.ready').write_text(str(os.getpid()))\n"
+            " while True: time.sleep(1)\n"
+            "else:\n"
+            " while not pathlib.Path(sys.argv[1] + '.ready').exists(): time.sleep(0.01)\n"
+            " pathlib.Path(sys.argv[1]).write_text(json.dumps({'leader':os.getpid(),'child':child}))\n"
+            + (" sys.exit(0)\n" if exit_leader else " time.sleep(30)\n")
+        )
+        return [sys.executable, "-c", code, str(witness), "sya-native-owned-fixture"], witness
+
+    def assert_group_gone(self, witness):
+        pids = json.loads(witness.read_text())
+        self.assertFalse(builder.process_group_exists(pids["leader"]))
+
+    def test_timeout_kills_logged_resistant_descendant_after_leader_exits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, witness = self.resistant_child_command(root)
+            env = builder.isolated_environment(root / "home", root / "tmp")
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                builder.run_bounded(command, env=env, cwd=root, timeout=0.3, log=root / "child.log")
+            self.assert_group_gone(witness)
+
+    def test_normal_leader_exit_also_cleans_unfinished_descendant(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, witness = self.resistant_child_command(root, exit_leader=True)
+            env = builder.isolated_environment(root / "home", root / "tmp")
+            with self.assertRaisesRegex(RuntimeError, "descendants"):
+                builder.run_bounded(command, env=env, cwd=root, timeout=5, log=root / "child.log")
+            self.assert_group_gone(witness)
+
+    def test_keyboard_interrupt_cleans_detached_process_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, witness = self.resistant_child_command(root)
+            env = builder.isolated_environment(root / "home", root / "tmp")
+            communicate = subprocess.Popen.communicate
+            interrupted = False
+
+            def interrupt_once(process, *args, **kwargs):
+                nonlocal interrupted
+                if not interrupted:
+                    interrupted = True
+                    deadline = time.monotonic() + 3
+                    while not witness.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(witness.exists())
+                    raise KeyboardInterrupt()
+                return communicate(process, *args, **kwargs)
+
+            with mock.patch.object(subprocess.Popen, "communicate", interrupt_once):
+                with self.assertRaises(KeyboardInterrupt):
+                    builder.run_bounded(command, env=env, cwd=root, timeout=10, log=root / "child.log")
+            self.assert_group_gone(witness)
+
+    def test_cli_sigterm_enters_child_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, witness = self.resistant_child_command(root)
+            env = builder.isolated_environment(root / "home", root / "tmp")
+            code = (
+                "import importlib.util,json,sys\n"
+                "s=importlib.util.spec_from_file_location('builder',sys.argv[1]); b=importlib.util.module_from_spec(s); s.loader.exec_module(b)\n"
+                "command=json.loads(sys.argv[2]); root=sys.argv[3]\n"
+                "b.build=lambda args: b.run_bounded(command,env=b.isolated_environment(root+'/inner-home',root+'/inner-tmp'),cwd=root,timeout=60,log=root+'/child.log')\n"
+                "sys.argv=['builder','--output',root+'/unused','--sdk-provenance',root+'/unused','--node-executable',root+'/unused','--wheelhouse',root+'/unused']\n"
+                "b.main()\n"
+            )
+            process = subprocess.Popen([sys.executable, "-c", code, str(ROOT / "scripts/build-native-runtime.py"),
+                                        json.dumps(command), str(root)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 5
+                while not witness.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(witness.exists())
+                process.send_signal(signal.SIGTERM)
+                _output, error = process.communicate(timeout=12)
+                self.assertEqual(process.returncode, 128 + signal.SIGTERM, error.decode())
+                self.assert_group_gone(witness)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=3)
+                if witness.exists():
+                    try:
+                        os.killpg(json.loads(witness.read_text())["leader"], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_snapshot_binds_live_contracts_lock_and_provenance_without_private_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, output = Path(temporary) / "source", Path(temporary) / "output"
+            root.mkdir()
+            for name in ("server.py", "manifest.json", "private-config.json"):
+                (root / name).write_text(name)
+            lock, provenance = root / "lock", root / "sdk.json"
+            lock.write_text("same-version old-hash")
+            provenance.write_text("sdk")
+            with mock.patch.object(builder, "ROOT", root), mock.patch.object(builder, "SOURCE_FILES", ("server.py", "manifest.json")):
+                snapshot, bindings, digest = builder.source_snapshot(output, lock, provenance, Path(sys.executable).resolve())
+                self.assertFalse((snapshot / "private-config.json").exists())
+                self.assertEqual(len(digest), 64)
+                (snapshot / "private-config.json").write_text("unexpected")
+                with self.assertRaisesRegex(RuntimeError, "file set changed"):
+                    builder.verify_input_bindings(snapshot, bindings)
+                (snapshot / "private-config.json").unlink()
+                for changed in (root / "server.py", root / "manifest.json", lock, provenance):
+                    original = changed.read_bytes()
+                    changed.write_bytes(original + b" mutation")
+                    with self.assertRaisesRegex(RuntimeError, "Live build input changed"):
+                        builder.verify_input_bindings(snapshot, bindings)
+                    changed.write_bytes(original)
+                (snapshot / "server.py").write_text("mutated copy")
+                with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+                    builder.verify_input_bindings(snapshot, bindings)
+
+    def test_node_and_wheelhouse_must_be_explicit_absolute_inputs(self):
+        for directory in (False, True):
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                builder.absolute_input("relative", directory=directory)
+
+    @unittest.skipUnless(shutil.which("node"), "requires explicit local Node for actual HTTP wrapper test")
+    def test_http_wrapper_calls_imported_helper_once_without_cli_entry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary).resolve()
+            stage = output / "stage"
+            stage.mkdir()
+            snapshot = output / "snapshot"
+            (snapshot / "scripts").mkdir(parents=True)
+            # Match the real helper's CLI guard so a successful import cannot
+            # silently run the same validation twice before JSON is parsed.
+            (snapshot / "scripts/test-staged-runtime.mjs").write_text("""
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+export async function testStagedRuntime(directory, options = {}) {
+  fs.appendFileSync(path.join(directory, 'calls.jsonl'), JSON.stringify({
+    directory, startupTimeoutMs: options.startupTimeoutMs,
+    requestTimeoutMs: options.requestTimeoutMs, stopTimeoutMs: options.stopTimeoutMs,
+    hasSignal: options.signal instanceof AbortSignal,
+  }) + '\\n');
+  return { runtimeSha256: 'a'.repeat(64), sseHandshake: true, authenticatedOperations: 29 };
+}
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  console.log(JSON.stringify(await testStagedRuntime(process.argv[2])));
+}
+""")
+            result = builder.verify_http_stage(stage, output, Path(shutil.which("node")).resolve(), snapshot)
+            self.assertEqual(result["authenticatedOperations"], 29)
+            calls = [json.loads(line) for line in (stage / "calls.jsonl").read_text().splitlines()]
+            self.assertEqual(calls, [{"directory": str(stage), "startupTimeoutMs": 30000,
+                                     "requestTimeoutMs": 1500, "stopTimeoutMs": 2000, "hasSignal": True}])
+
+    @unittest.skipUnless(shutil.which("node"), "requires explicit local Node for actual HTTP mutation test")
+    def test_missing_native_server_main_fails_http_despite_self_test_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            stage = output / "stage"
+            (stage / "bin").mkdir(parents=True)
+            for name in ("manifest.json", "module.json", "api.openapi.json", "package.json", "server.py", "realsense_runtime.py"):
+                shutil.copyfile(ROOT / name, stage / name)
+            # Reproduce the review mutation on the real entry source. The fake
+            # diagnostic intentionally passes; only the service smoke can catch it.
+            source = (ROOT / "packaging/native_entry.py").read_text()
+            self.assertIn("server.main()", source)
+            mutated = source.replace("server.main()", "pass  # regression: server startup removed")
+            executable = stage / "bin/monitor-server"
+            executable.write_text("#!" + sys.executable + "\n" + mutated)
+            executable.chmod(0o700)
+            (stage / "native_self_test.py").write_text(
+                "def run_self_test(): return {'ok': True, 'frozen': True, 'nativeLibraries': {'checked': True}}\n")
+            # TLS entry bootstrap is also real source, without network activity.
+            if (ROOT / "packaging/native_tls.py").is_file():
+                shutil.copyfile(ROOT / "packaging/native_tls.py", stage / "native_tls.py")
+            self.assertTrue(builder.verify_candidate(executable, output, 10)["ok"])
+            with self.assertRaisesRegex(RuntimeError, "startup|exited"):
+                builder.verify_http_stage(stage, output, Path(shutil.which("node")).resolve(), ROOT)
+
+    @unittest.skipUnless(importlib.util.find_spec("PyInstaller") and importlib.util.find_spec("mediapipe"),
+                         "requires the actual locked native build environment")
+    def test_real_mediapipe_collection_keeps_runtime_and_avoids_optional_converter(self):
+        from PyInstaller.utils.hooks import collect_submodules
+
+        # Execute just the spec's selection function, without running a build.
+        parsed = ast.parse((ROOT / "packaging" / "monitor.spec").read_text())
+        selection = next(node for node in parsed.body if isinstance(node, ast.FunctionDef) and node.name == "runtime_module")
+        namespace = {}
+        exec(compile(ast.Module(body=[selection], type_ignores=[]), "monitor.spec", "exec"), namespace)
+        modules = collect_submodules("mediapipe", filter=namespace["runtime_module"], on_error="raise")
+        for required in ("mediapipe.python.solutions.face_mesh", "mediapipe.python.solution_base",
+                         "mediapipe.python._framework_bindings", "mediapipe.calculators.core.gate_calculator_pb2",
+                         "mediapipe.tasks.python.genai", "mediapipe.tasks.python.vision.face_landmarker"):
+            self.assertIn(required, modules)
+        for tool in ("mediapipe.tasks.python.genai.converter", "mediapipe.model_maker"):
+            self.assertFalse(any(name == tool or name.startswith(tool + ".") for name in modules))
+
+    def test_lock_requires_exact_versions_and_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock"
+            rows = [f"{name}=={version} --hash=sha256:{'a' * 64}" for name, version in
+                    {"PyInstaller": "6.22.3", "numpy": "1.26.4", "Pillow": "11.3.0", "mediapipe": "0.10.21"}.items()]
+            path.write_text("\n".join(rows))
+            self.assertEqual(builder.locked_versions(path)["pillow"], "11.3.0")
+            for invalid in (rows + [rows[0]], [row.split(" --hash")[0] for row in rows],
+                            rows + ["--extra-index-url https://example.invalid"],
+                            [row.replace("0.10.21", "0.10.22") for row in rows]):
+                path.write_text("\n".join(invalid))
+                with self.assertRaises(ValueError):
+                    builder.locked_versions(path)
+
+    def test_repository_lock_can_be_parsed(self):
+        versions = builder.locked_versions(ROOT / "packaging" / "requirements-macos-arm64.lock")
+        self.assertIn("jaxlib", versions)
+        self.assertIn("opencv-contrib-python", versions)
+        self.assertIn("protobuf", versions)
+
+    def test_environment_does_not_forward_credentials_or_python_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(os.environ, {"SYA_WORK_CONTEXT_API_KEY": "private", "GH_TOKEN": "private",
+                                            "PYTHONPATH": "/injected", "DYLD_LIBRARY_PATH": "/injected",
+                                            "MONITOR_PYTHON": "/injected"}):
+                env = builder.isolated_environment(Path(temporary) / "home", Path(temporary) / "tmp")
+            for key in ("SYA_WORK_CONTEXT_API_KEY", "GH_TOKEN", "PYTHONPATH", "DYLD_LIBRARY_PATH", "MONITOR_PYTHON"):
+                self.assertNotIn(key, env)
+            self.assertEqual(env["PATH"], "")
+            self.assertEqual(json.loads(Path(env["MONITOR_CONFIG_PATH"]).read_text()), {})
+
+    def sdk_fixture(self, root):
+        records = []
+        for name in ("pyrealsense2.so", "pyrsutils.so", "librealsense2.2.54.2.dylib", "libusb-1.0.0.dylib"):
+            path = root / name
+            path.write_bytes(name.encode())
+            records.append({"path": str(path), "sha256": builder.sha256(path)})
+        value = {**builder.SDK_PINS, "architecture": "arm64", "pythonVersion": builder.platform.python_version(),
+                 "modules": dict(zip(("pyrealsense2", "pyrsutils"), records[:2])), "libraries": records[2:]}
+        path = root / "provenance.json"
+        path.write_text(json.dumps(value))
+        return path, value
+
+    def test_sdk_bindings_reject_changed_bits_source_and_resolution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, value = self.sdk_fixture(root)
+            resolver = lambda name: types.SimpleNamespace(origin=value["modules"][name]["path"])
+            with mock.patch.object(builder.importlib.util, "find_spec", side_effect=resolver):
+                self.assertEqual(builder.verify_sdk(path), value)
+                altered = {**value, "sdkCommit": "0" * 40}
+                path.write_text(json.dumps(altered))
+                with self.assertRaisesRegex(ValueError, "sdkCommit"):
+                    builder.verify_sdk(path)
+                path.write_text(json.dumps(value))
+                Path(value["libraries"][0]["path"]).write_bytes(b"changed")
+                with self.assertRaisesRegex(ValueError, "checksum"):
+                    builder.verify_sdk(path)
+            path, value = self.sdk_fixture(root)
+            with mock.patch.object(builder.importlib.util, "find_spec", return_value=types.SimpleNamespace(origin="/different/module.so")):
+                with self.assertRaisesRegex(ValueError, "resolution"):
+                    builder.verify_sdk(path)
+
+    def test_existing_output_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            witness = output / "existing"
+            witness.write_text("preserve")
+            args = types.SimpleNamespace(requirements_lock="unused", sdk_provenance="unused", output=output)
+            with mock.patch.object(builder, "verify_environment"), mock.patch.object(builder, "verify_sdk"):
+                with self.assertRaisesRegex(ValueError, "overwrite"):
+                    builder.build(args)
+            self.assertEqual(witness.read_text(), "preserve")
+
+    def test_output_rejects_source_aliases_git_and_user_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            root.mkdir()
+            alias = Path(temporary) / "source-alias"
+            alias.symlink_to(root, target_is_directory=True)
+            with mock.patch.object(builder, "ROOT", root):
+                for unsafe in (root / "new", root / "build" / ".." / "new", alias / "new",
+                               root / "build" / ".git" / "new", Path.home() / ".sya" / "new-native"):
+                    with self.subTest(path=unsafe), self.assertRaises(ValueError):
+                        builder.candidate_output(unsafe)
+                self.assertEqual(builder.candidate_output(root / "build" / "new"), (root / "build" / "new").resolve())
+                self.assertEqual(builder.candidate_output(root / "dist" / "new"), (root / "dist" / "new").resolve())
+                self.assertEqual(builder.candidate_output(Path(temporary) / "new"), (Path(temporary) / "new").resolve())
+
+    def test_failed_process_preserves_bounded_stderr_for_loader_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            env = builder.isolated_environment(Path(temporary) / "home", Path(temporary) / "tmp")
+            with self.assertRaisesRegex(RuntimeError, "Library not loaded: missing.dylib"):
+                builder.run_bounded([sys.executable, "-c", "import sys; sys.stderr.write('Library not loaded: missing.dylib'); sys.exit(1)"],
+                                    env=env, cwd=temporary, timeout=5)
+
+    def test_real_child_timeout_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            env = builder.isolated_environment(Path(temporary) / "home", Path(temporary) / "tmp")
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                builder.run_bounded([sys.executable, "-c", "import time; time.sleep(30)"],
+                                    env=env, cwd=temporary, timeout=0.05)
+
+    def test_self_test_entry_never_imports_server(self):
+        fake_test = types.ModuleType("native_self_test")
+        fake_test.run_self_test = mock.Mock(return_value={"ok": True})
+        original_import = __import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "server":
+                raise AssertionError("Diagnostics imported the HTTP server")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch.dict(sys.modules, {"native_self_test": fake_test}), \
+                mock.patch.object(sys, "argv", ["native", "--self-test"]), \
+                mock.patch("builtins.__import__", side_effect=guarded_import), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(entry.main(), 0)
+        self.assertEqual(json.loads(output.getvalue()), {"ok": True})
+        fake_test.run_self_test.assert_called_once_with()
+
+    def test_self_test_failure_cannot_report_success(self):
+        fake_test = types.ModuleType("native_self_test")
+        fake_test.run_self_test = mock.Mock(side_effect=RuntimeError("Missing model"))
+        with mock.patch.dict(sys.modules, {"native_self_test": fake_test}), \
+                mock.patch.object(sys, "argv", ["native", "--self-test"]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(entry.main(), 1)
+        self.assertFalse(json.loads(output.getvalue())["ok"])
+
+
+class NativeShutdownTests(unittest.TestCase):
+    def adapter(self):
+        adapter = server.RealSenseAdapter()
+        for method in ("status", "list_devices", "_usb_realsense_devices", "_records_dir"):
+            setattr(adapter, method, mock.Mock(side_effect=AssertionError("Unexpected device/config access")))
+        return adapter
+
+    def test_inactive_shutdown_does_not_enumerate_devices_or_read_config(self):
+        adapter = self.adapter()
+        self.assertTrue(adapter.shutdown())
+        self.assertTrue(adapter.stop_event.is_set())
+
+    def test_shutdown_releases_only_acquired_resources(self):
+        adapter = self.adapter()
+        pipeline, detector = mock.Mock(), mock.Mock()
+        adapter.pipeline, adapter.focus_detector, adapter.active = pipeline, detector, True
+        adapter._publish_access_boundary = mock.Mock()
+        adapter._boundary = mock.Mock()
+        self.assertTrue(adapter.shutdown())
+        pipeline.stop.assert_called_once_with()
+        detector.close.assert_called_once_with()
+        self.assertIsNone(adapter.pipeline)
+        self.assertFalse(adapter.active)
+
+    def test_detector_close_failure_is_reported_and_handle_retained(self):
+        adapter = self.adapter()
+        detector = mock.Mock()
+        detector.close.side_effect = RuntimeError("Failed to close native graph")
+        adapter.focus_detector = detector
+        self.assertFalse(adapter.shutdown())
+        self.assertIs(adapter.focus_detector, detector)
+        self.assertIn("focus inference", adapter.last_error)
+
+    def test_shutdown_latch_rejects_queued_and_future_start(self):
+        adapter = self.adapter()
+        adapter._load_sdk = mock.Mock(side_effect=AssertionError("SDK acquired after terminal shutdown"))
+        errors = []
+
+        def start():
+            try:
+                adapter.start()
+            except Exception as error:
+                errors.append(error)
+
+        adapter.lifecycle_lock.acquire()
+        starting = threading.Thread(target=start)
+        stopping = threading.Thread(target=adapter.shutdown)
+        try:
+            starting.start()
+            stopping.start()
+            deadline = time.monotonic() + 1
+            while not adapter._shutting_down and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(adapter._shutting_down)
+        finally:
+            adapter.lifecycle_lock.release()
+        starting.join(1)
+        stopping.join(1)
+        self.assertFalse(starting.is_alive() or stopping.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], server.RealSenseActionError)
+        with self.assertRaises(server.RealSenseActionError):
+            adapter.start()
+        adapter._load_sdk.assert_not_called()
+
+    def test_failed_shutdown_retains_active_handle_without_enumerating(self):
+        adapter = self.adapter()
+        pipeline = mock.Mock()
+        pipeline.stop.side_effect = RuntimeError("SDK failed to release")
+        adapter.pipeline, adapter.active = pipeline, True
+        adapter._publish_access_boundary = mock.Mock()
+        adapter._boundary = mock.Mock()
+        self.assertFalse(adapter.shutdown())
+        self.assertIs(adapter.pipeline, pipeline)
+        self.assertTrue(adapter.active)
+
+    def run_main(self, shutdown, deadline=0.1):
+        handlers = {}
+
+        def signal_handler(number, handler):
+            old = handlers.get(number, signal.SIG_DFL)
+            handlers[number] = handler
+            return old
+
+        httpd = mock.MagicMock()
+        httpd.__enter__.return_value = httpd
+        httpd.handle_request.side_effect = lambda: handlers[signal.SIGTERM](signal.SIGTERM, None)
+        with mock.patch.object(server, "ThreadedHTTPServer", return_value=httpd), \
+                mock.patch.object(server, "load_api_config", return_value={"path": "", "key": ""}), \
+                mock.patch.object(server, "resolve_port", return_value=0), \
+                mock.patch.object(server.signal, "signal", side_effect=signal_handler), \
+                mock.patch.object(server.REALSENSE, "shutdown", side_effect=shutdown), \
+                contextlib.redirect_stdout(io.StringIO()):
+            server.main(shutdown_timeout=deadline)
+        self.assertEqual(handlers, {signal.SIGTERM: signal.SIG_DFL, signal.SIGINT: signal.SIG_DFL})
+
+    def test_sigterm_runs_no_discovery_shutdown_and_restores_handlers(self):
+        shutdown = mock.Mock(return_value=True)
+        self.run_main(shutdown)
+        shutdown.assert_called_once_with()
+
+    def test_main_shutdown_failure_is_not_successful_exit(self):
+        with self.assertRaisesRegex(RuntimeError, "shutdown"):
+            self.run_main(lambda: False)
+
+    def test_main_shutdown_deadline_is_bounded(self):
+        release = threading.Event()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                self.run_main(lambda: release.wait(30), deadline=0.01)
+        finally:
+            release.set()
+
+    def test_real_server_sigterm_exits_without_device_discovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            env = builder.isolated_environment(Path(temporary) / "home", Path(temporary) / "tmp")
+            env["PORT"] = str(port)
+            code = (
+                "import sys; sys.path.insert(0, sys.argv[1]); import server\n"
+                "def forbidden(*args, **kwargs): raise AssertionError('Device/config discovery during shutdown')\n"
+                "server.REALSENSE.status = forbidden\n"
+                "server.REALSENSE.list_devices = forbidden\n"
+                "server.REALSENSE._usb_realsense_devices = forbidden\n"
+                "server.REALSENSE._records_dir = forbidden\n"
+                "server.main()\n"
+            )
+            process = subprocess.Popen([sys.executable, "-c", code, str(ROOT)], env=env, cwd=temporary,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        with opener.open(f"http://127.0.0.1:{port}/health", timeout=0.2) as response:
+                            self.assertEqual(response.status, 200)
+                        break
+                    except (urllib.error.URLError, TimeoutError):
+                        if time.monotonic() >= deadline or process.poll() is not None:
+                            self.fail("The isolated real HTTP service did not start.")
+                        time.sleep(0.02)
+                process.send_signal(signal.SIGTERM)
+                _out, error = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0, error.decode())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=3)
+
+
+if __name__ == "__main__":
+    unittest.main()
