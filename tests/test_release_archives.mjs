@@ -8,26 +8,28 @@ import test from 'node:test';
 import { runtimeTreeSha256 } from '../scripts/hash-runtime.mjs';
 
 const workflow = fs.readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
-const archiveBlock = workflow.match(/      - name: Create platform archives\n        shell: bash\n        run: \|\n([\s\S]*?)\n      - name:/)?.[1];
+const archiveBlock = workflow.match(/      - name: Create platform archives\n[\s\S]*?        run: \|\n([\s\S]*?)\n      - name:/)?.[1];
 assert(archiveBlock, 'actual archive workflow step must exist');
-const script = archiveBlock.replace(/^          /gm, '').replaceAll('${{ steps.meta.outputs.version }}', '0.2.0');
+const script = archiveBlock.replace(/^          /gm, '');
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-archive-test-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  for (const name of ['release/stage/empty', 'release/stage/bin', 'release/out', 'scripts']) fs.mkdirSync(path.join(root, name), { recursive: true });
+  for (const name of ['release/stage/empty', 'release/stage/bin', 'scripts', 'runner']) fs.mkdirSync(path.join(root, name), { recursive: true });
   fs.writeFileSync(path.join(root, 'release/stage/bin/monitor-server'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   fs.writeFileSync(path.join(root, 'release/stage/payload'), Buffer.from([0, 1, 254, 255]));
   fs.copyFileSync(new URL('../scripts/hash-runtime.mjs', import.meta.url), path.join(root, 'scripts/hash-runtime.mjs'));
+  fs.copyFileSync(new URL('../scripts/archive-runtime.sh', import.meta.url), path.join(root, 'scripts/archive-runtime.sh'));
   const digest = runtimeTreeSha256(path.join(root, 'release/stage'));
   fs.writeFileSync(path.join(root, 'release/smoke-result.json'), JSON.stringify({ runtimeSha256: digest }));
+  fs.writeFileSync(path.join(root, 'runner/monitor-release-source.json'), JSON.stringify({ sourceSha: 'a'.repeat(40), tag: 'v0.2.0' }));
   return { root, digest };
 }
 
 function run(root, extraPath = '') {
   return spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script], {
     cwd: root, encoding: 'utf8', timeout: 15000,
-    env: { PATH: `${extraPath ? `${extraPath}${path.delimiter}` : ''}${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`, HOME: root },
+    env: { PATH: `${extraPath ? `${extraPath}${path.delimiter}` : ''}${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`, HOME: root, RUNNER_TEMP: path.join(root, 'runner'), RELEASE_VERSION: '0.2.0' },
   });
 }
 
@@ -48,7 +50,9 @@ test('actual archive step preserves the smoke digest across all ZIP/tar assets a
   for (const platform of ['macos-arm64', 'macos-x64', 'windows-x64', 'linux-x64']) {
     assert.equal(runtimeTreeSha256(path.join(root, 'release/verify', platform)), digest);
   }
-  assert.equal(fs.readFileSync(path.join(output, 'SHA256SUMS.txt'), 'utf8').trim().split('\n').length, 8);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(output, 'source-provenance.json'))), { sourceSha: 'a'.repeat(40), tag: 'v0.2.0' });
+  assert.equal(fs.existsSync(path.join(root, 'release/stage/source-provenance.json')), false);
+  assert.equal(fs.readFileSync(path.join(output, 'SHA256SUMS.txt'), 'utf8').trim().split('\n').length, 9);
 });
 
 test('actual archive step rejects a stage changed after successful smoke before creating any archive', t => {
@@ -56,7 +60,7 @@ test('actual archive step rejects a stage changed after successful smoke before 
   fs.appendFileSync(path.join(root, 'release/stage/payload'), 'changed after smoke');
   const result = run(root);
   assert.equal(result.error, undefined); assert.notEqual(result.status, 0);
-  assert.deepEqual(fs.readdirSync(path.join(root, 'release/out')), []);
+  assert.equal(fs.existsSync(path.join(root, 'release/out')), false);
 });
 
 test('actual archive step rejects an archive whose unpacked tree differs from the tested stage', t => {

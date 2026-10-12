@@ -156,6 +156,61 @@ workflow 将 smoke 输出保存于 stage 外，所有归档均解包核对同一
 之后才生成外部双摘要元数据。它不验证硬件、模型结果或跨平台 binary；
 当前 wrapper 依赖外部 Python 的限制仍然存在。
 
+### 发布源码与现有 tag 绑定
+
+发布 workflow 在构建前和发布前各运行一次
+`scripts/verify-release-source.mjs`。它只读取 Git refs 与 GitHub release 列表，
+要求正常 `X.Y.Z` 版本与 manifest、package、OpenAPI 一致；已有 `vX.Y.Z`
+tag 的本地与远程对象必须一致，其解析后的 commit 必须等于检出的 HEAD 与
+`GITHUB_SHA`，且该 commit 必须属于当前远端 `main` 历史。`workflow_dispatch` 不会根据
+输入偷偷切换源码；选中的 branch/tag 必须正好指向待发布 commit。
+缺失 tag、未合并源码、工作区已修改、tag 移动或读取远端失败均中止。
+
+两次检查之间保存的绑定必须不变。`source-provenance.json` 位于 release asset
+目录，随 archive、双摘要文件一起写入 `SHA256SUMS.txt`，不注入 runtime 目录。
+其字段是 `schemaVersion`、`repository`、`tag`、`version`、`sourceSha`、
+`tagObjectSha` 和 `trustedBranch`。这是发布流程声明的来源信息，不是独立签名
+或 GitHub attestation；消费者仍须从可信 release 下载并独立校验 archive/tree。
+
+发布前使用分页 release API 检查所有已发布项和 draft；同 tag 已存在时拒绝
+继续。发布步骤使用 GitHub CLI 的 create-only 命令并启用 `--verify-tag`，
+不再使用默认可更新同 tag release 的 action。GitHub CLI 对携带附件的 create
+先创建新 draft、上传附件，再发布；失败不进入覆盖既有资产的路径。
+参考 [GitHub CLI create](https://cli.github.com/manual/gh_release_create)、
+[Release API](https://docs.github.com/en/rest/releases/releases) 和
+[workflow_dispatch commit 语义](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)。
+
+每个 tag 的 workflow 串行执行，但检查与远端发布之间仍可能发生外部 ref 修改。
+仓库的 tag protection / immutable-release 设置负责约束这个剩余窗口及发布后的
+修改；本地测试未查询或配置这些远端策略，因此不宣称永久不可变。已有 release
+或 draft 不会自动删除、编辑或重用；需要人工核查并选择新的版本。
+
+```bash
+node tests/test_release_source.mjs
+```
+
+测试使用临时本地 Git 仓库和模拟的只读 GitHub CLI 响应，覆盖 annotated tag、
+分支与事件 SHA 错配、main ancestry、同 commit tag 对象重写、已有 draft、
+网络错误和发布 shell 的拒绝传播；不创建真实 tag/release，不调用远端发布。
+
+普通 PR 使用独立的只读 CI。CI 与发布共用 `scripts/stage-runtime.sh` 和
+`scripts/archive-runtime.sh`：前者原子占用新输出目录，拒绝输出嵌入输入目录，
+只复制 Git 管理的 scripts/patches 与三个 adapter 入口的编译文件；后者沿用已通过
+smoke 的摘要，对四种归档逐项解包复算。PR 不生成虚假的 tag 来源记录或上传资产。
+最终发布还要求精确的资产集合和完整、无重复的校验清单，上传仅使用验证后的列表。
+
+在模块根目录可运行非发布检查（目标 `release/stage` 与 `release/out` 须尚不存在）：
+
+```bash
+npm ci --ignore-scripts
+npm run build
+bash scripts/stage-runtime.sh
+node scripts/test-staged-runtime.mjs release/stage > release/smoke-result.json
+bash scripts/archive-runtime.sh 0.2.0
+```
+
+该配方仍为依赖外部 Python 的本地候选包，不证明四个平台原生运行或正式发布完成。
+
 ## Intel RealSense Camera Source
 
 The monitor runtime can expose an Intel RealSense RGB-D camera as a camera data
