@@ -48,6 +48,12 @@ class HttpRuntimeTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["ok"])
 
+    def test_event_stream_rejects_missing_and_wrong_tokens(self):
+        for headers in ({}, {"Authorization": "Bearer incorrect"}):
+            status, body = self.request("GET", "/api/monitor/events", headers=headers)
+            self.assertEqual(status, 401)
+            self.assertEqual(json.loads(body)["error"]["code"], "UNAUTHORIZED")
+
     def test_static_server_does_not_expose_config_or_repository(self):
         for path in ["/config.local.json", "/config.example.json", "/.git/config", "/server.py"]:
             status, _body = self.request("GET", path, headers=self.authorized_headers())

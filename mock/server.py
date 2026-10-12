@@ -13,15 +13,20 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import queue
 import sys
 import threading
 import time
 import urllib.parse
+import uuid
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 MOCK_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(MOCK_DIR))
+from realsense_runtime import ACCESS_COVERAGE, EventBroker, critical_event_id, attention_observation, realsense_access_event
+
 DATA_PATH = os.path.join(MOCK_DIR, "data.json")
 MANIFEST_PATH = os.path.join(os.path.dirname(MOCK_DIR), "manifest.json")
 
@@ -107,12 +112,21 @@ STORAGE = dict(_INITIAL["storage"])
 SCREEN_RECORDS = list(_INITIAL["screenRecords"])
 CAMERA_RECORDS = list(_INITIAL["cameraRecords"])
 ATTENTION = dict(_INITIAL["attentionConfig"])
+_ATTENTION_SESSION = str(uuid.uuid4())
+_ATTENTION_RECORD = None
+_ATTENTION_STOPPED = False
 
 # Incrementing counters to make mock data feel alive
 _SCREEN_COUNTER = len(SCREEN_RECORDS) + 1
 _CAMERA_COUNTER = len(CAMERA_RECORDS) + 1
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
+REALSENSE = {"source": "realsense", "active": False, "available": True,
+             "sessionId": str(uuid.uuid4()), "accessCoverage": ACCESS_COVERAGE,
+             "startedAt": None, "totalFrames": 0, "totalSamples": 0,
+             "lastFrameTime": None, "lastSamplePath": "", "error": "", "trainingSession": None,
+             "devices": [], "preview": {"enabled": False, "available": False, "fps": 0, "error": ""},
+             "inference": {"enabled": False, "available": False, "state": "unknown", "error": ""}}
 
 
 def _now_iso() -> str:
@@ -207,7 +221,15 @@ def _h_camera_status():
 
 
 def _h_camera_start(_payload=None):
+    global _ATTENTION_SESSION, _ATTENTION_RECORD, _ATTENTION_STOPPED
+    if isinstance(_payload, dict) and (_payload.get("source") == "realsense" or _payload.get("dataSource") == "realsense"):
+        _h_realsense_start(_payload)
+        return _h_camera_status()
     with _LOCK:
+        if not CAMERA.get("isActive"):
+            _ATTENTION_SESSION = str(uuid.uuid4())
+            _ATTENTION_RECORD = None
+        _ATTENTION_STOPPED = False
         CAMERA["isActive"] = True
         CAMERA["windowCreated"] = True
         CAMERA["lastFrameTime"] = _now_iso()
@@ -217,7 +239,20 @@ def _h_camera_start(_payload=None):
 
 
 def _h_camera_stop(_payload=None):
+    global _ATTENTION_RECORD, _ATTENTION_STOPPED
+    if CAMERA.get("source") == "realsense" or (isinstance(_payload, dict) and _payload.get("source") == "realsense"):
+        _h_realsense_stop(_payload)
+        return _h_camera_status()
     with _LOCK:
+        if not _ATTENTION_STOPPED:
+            _ATTENTION_RECORD = attention_observation(
+                {"state": "unknown", "source": "mock-api", "confidence": None,
+                 "reason": "Mock camera stopped.", "modelVersion": "mock-1"},
+                _ATTENTION_RECORD, _ATTENTION_SESSION, 500, int(time.time() * 1000), "stopped",
+            )
+            ATTENTION.update(_ATTENTION_RECORD, attentionStatus="unknown")
+            _broadcast_event("attention.status", dict(ATTENTION))
+        _ATTENTION_STOPPED = True
         CAMERA["isActive"] = False
         status = dict(CAMERA)
     _broadcast_event("camera.status", status)
@@ -241,6 +276,70 @@ def _h_camera_hide(_payload=None):
 
 
 # -- Storage --------------------------------------------------------------
+
+def _h_realsense_status():
+    with _LOCK:
+        return json.loads(json.dumps(REALSENSE))
+
+
+def _h_realsense_start(payload=None):
+    with _LOCK:
+        if not REALSENSE["active"]:
+            REALSENSE.update(active=True, sessionId=str(uuid.uuid4()), startedAt=_now_iso(), error="")
+        CAMERA.update(source="realsense", isActive=True)
+        return _h_realsense_status()
+
+
+def _h_realsense_end(code="REALSENSE_STOPPED"):
+    with _LOCK:
+        was_active = REALSENSE["active"]
+        REALSENSE["active"] = code == "REALSENSE_STOP_FAILED"
+        CAMERA.update(source="realsense" if REALSENSE["active"] else "builtin", isActive=REALSENSE["active"])
+        if was_active:
+            operation = "session-stop" if code in ("REALSENSE_STOPPED", "REALSENSE_STOP_FAILED") else "stream-error"
+            _broadcast_event("realsense.access", realsense_access_event(REALSENSE["sessionId"], operation, code, REALSENSE["active"]))
+        return _h_realsense_status()
+
+
+def _h_realsense_stop(_payload=None):
+    return _h_realsense_end()
+
+
+def _h_realsense_capture(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    with _LOCK:
+        started = not REALSENSE["active"]
+        if started and payload.get("startIfNeeded", True) is False:
+            return _err("REALSENSE_CAPTURE_FAILED", "RealSense manual sample could not be captured.")
+        if started:
+            _h_realsense_start(payload)
+        REALSENSE["totalSamples"] += 1
+        sample = {"source": "realsense", "sampleId": f"mock-sample-{uuid.uuid4()}", "capturedAt": _now_iso(),
+                  "frameNumber": REALSENSE["totalSamples"], "color": None, "depth": None, "attention": None}
+        if REALSENSE["trainingSession"] or payload.get("purpose") == "training":
+            _broadcast_event("realsense.training.sample", sample)
+        if started and payload.get("keepRunning", False) is not True:
+            _h_realsense_stop()
+        return sample
+
+
+def _h_realsense_training_start(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    with _LOCK:
+        REALSENSE["trainingSession"] = {"sessionId": payload.get("sessionId") or f"mock-training-{uuid.uuid4()}", "startedAt": _now_iso()}
+        if payload.get("autoStart", True) is not False:
+            _h_realsense_start(payload)
+        return _h_realsense_status()
+
+
+def _h_realsense_training_stop(payload=None):
+    with _LOCK:
+        session = REALSENSE["trainingSession"]
+        REALSENSE["trainingSession"] = None
+        if isinstance(payload, dict) and payload.get("stopCamera") is True:
+            _h_realsense_stop()
+        return {"stoppedAt": _now_iso(), "session": session, "status": _h_realsense_status()}
+
 
 def _h_storage_stats():
     with _LOCK:
@@ -274,6 +373,7 @@ _ATTENTION_STATUSES = {"focused", "distracted", "away", "unknown"}
 
 
 def _h_attention_status_set(payload: dict | None):
+    global _ATTENTION_RECORD
     if not isinstance(payload, dict):
         return _err("INVALID_PAYLOAD", "Payload must be an object.")
 
@@ -296,6 +396,20 @@ def _h_attention_status_set(payload: dict | None):
         confidence = round(float(confidence), 3)
 
     with _LOCK:
+        if _ATTENTION_STOPPED:
+            return _err("MONITOR_STOPPED", "Start the mock camera before supplying another observation.")
+        boundary = payload.get("boundary")
+        if boundary not in (None, "disconnected"):
+            return _err("INVALID_PAYLOAD", "Use camera.stop for stopped boundaries; only disconnected is accepted here.")
+        _ATTENTION_RECORD = attention_observation(
+            {"state": attention_status, "source": str(payload.get("source") or "mock-api"),
+             "confidence": confidence, "reason": str(payload.get("reason") or "Synthetic observation."),
+             "modelVersion": "mock-1"},
+            _ATTENTION_RECORD, _ATTENTION_SESSION, 500, int(time.time() * 1000), boundary,
+        )
+        ATTENTION.pop("boundary", None)
+        ATTENTION.update(_ATTENTION_RECORD)
+        attention_status = _ATTENTION_RECORD["state"]
         ATTENTION["attentionStatus"] = attention_status
         ATTENTION["lastUpdatedAt"] = _now_iso()
         ATTENTION["source"] = str(payload.get("source") or "mock-api")
@@ -307,8 +421,9 @@ def _h_attention_status_set(payload: dict | None):
             ATTENTION["reason"] = str(payload["reason"])
         status = dict(ATTENTION)
 
-    _broadcast_event("attention.status", status)
-    _broadcast_event("attention.config.status", status)
+        # Share the lifecycle lock with stop so no observation follows its boundary.
+        _broadcast_event("attention.status", status)
+        _broadcast_event("attention.config.status", status)
     return status
 
 
@@ -360,12 +475,29 @@ ACTION_HANDLERS: dict[str, tuple] = {
     "attention.status.set":    (_h_attention_status_set,),
 }
 
+# RealSense actions use the same routes and lifecycle metadata as the real
+# provider. Fixtures never open hardware, write samples, or claim raw-frame counts.
+_REALSENSE_HANDLERS = [
+    ("realsense.status", "GET", "status", _h_realsense_status),
+    ("realsense.devices", "GET", "devices", lambda: []),
+    ("realsense.start", "POST", "start", _h_realsense_start),
+    ("realsense.stop", "POST", "stop", _h_realsense_stop),
+    ("realsense.capture", "POST", "capture", _h_realsense_capture),
+    ("realsense.frame.latest", "GET", "frame/latest", lambda: None),
+    ("realsense.training.start", "POST", "training/start", _h_realsense_training_start),
+    ("realsense.training.stop", "POST", "training/stop", _h_realsense_training_stop),
+]
+for _action, _method, _suffix, _handler in _REALSENSE_HANDLERS:
+    _path = f"/api/monitor/realsense/{_suffix}"
+    ACTION_DEFINITIONS.append({"action": _action, "method": _method, "path": _path, "description": "Synthetic RealSense lifecycle fixture."})
+    (GET_HANDLERS if _method == "GET" else POST_HANDLERS)[_path] = (_handler,)
+    ACTION_HANDLERS[_action] = (_handler,)
+
 
 # ---------------------------------------------------------------------------
 # SSE worker — pushes periodic events to connected clients
 # ---------------------------------------------------------------------------
-_SSE_CLIENTS: list[http.server.BaseHTTPRequestHandler] = []
-_SSE_LOCK = threading.Lock()
+EVENT_BROKER = EventBroker()
 
 # Mock event payloads rotated each cycle
 _SCREEN_WINDOWS = [
@@ -397,25 +529,7 @@ def _next_face() -> bool:
 
 
 def _broadcast_event(event: str, payload: dict):
-    body = json.dumps({"functionId": "monitor", "event": event, "payload": payload})
-    line = f"event: {event}\ndata: {body}\n\n"
-
-    with _SSE_LOCK:
-        clients = list(_SSE_CLIENTS)
-
-    dead = []
-    for client in clients:
-        try:
-            client.wfile.write(line.encode())
-            client.wfile.flush()
-        except Exception:
-            dead.append(client)
-
-    if dead:
-        with _SSE_LOCK:
-            for client in dead:
-                if client in _SSE_CLIENTS:
-                    _SSE_CLIENTS.remove(client)
+    EVENT_BROKER.publish(event, payload)
 
 
 def _sse_worker():
@@ -609,6 +723,8 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
             _h_camera_show,
             _h_camera_hide,
             _h_attention_status_set,
+            _h_realsense_start, _h_realsense_stop, _h_realsense_capture,
+            _h_realsense_training_start, _h_realsense_training_stop,
         ):
             self._send_result(handler(inner_payload))
         elif handler is _h_storage_screen_records:
@@ -623,32 +739,33 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
     # ----- SSE stream -----------------------------------------------------
 
     def _handle_sse(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self._cors()
-        self.end_headers()
-
-        # Emit ready event immediately
-        ready = json.dumps({"functionId": "monitor", "event": "ready", "payload": {}})
-        self.wfile.write(f"event: ready\ndata: {ready}\n\n".encode())
-        self.wfile.flush()
-
-        with _SSE_LOCK:
-            _SSE_CLIENTS.append(self)
-
-        # Keep the connection open — the SSE worker thread pushes events.
-        # We spin here so the handler doesn't return (which would close the conn).
+        subscriber = EVENT_BROKER.subscribe(self.headers.get("Last-Event-ID"))
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self._cors()
+            self.end_headers()
+            ready = json.dumps({"functionId": "monitor", "event": "ready", "payload": {}})
+            self.wfile.write(f"event: ready\ndata: {ready}\n\n".encode())
+            self.wfile.flush()
             while True:
-                time.sleep(1)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+                try:
+                    message = subscriber.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                    continue
+                cursor = critical_event_id(message)
+                event_id = f"id: {cursor}\n" if cursor else ""
+                body = json.dumps(message, separators=(",", ":"))
+                self.wfile.write(f"{event_id}event: {message['event']}\ndata: {body}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
         finally:
-            with _SSE_LOCK:
-                if self in _SSE_CLIENTS:
-                    _SSE_CLIENTS.remove(self)
+            EVENT_BROKER.unsubscribe(subscriber)
 
 
 # ---------------------------------------------------------------------------

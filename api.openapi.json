@@ -636,6 +636,15 @@
     "/api/monitor/events": {
       "get": {
         "operationId": "events",
+        "parameters": [
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Resume strictly after this retained attention observation or RealSense access event ID. The runtime retains the latest 2048 critical metadata events in one bounded in-memory buffer. Absent, unknown, or evicted IDs start live only; no full backfill is implied."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Monitor server-sent events stream",
@@ -647,7 +656,8 @@
               }
             }
           }
-        }
+        },
+        "description": "Authenticated SSE; attention.status and realsense.access carry stable record IDs as SSE IDs. realsense.access uses RealSenseAccessEvent and reports session-stop or asynchronous stream-error metadata, never images, serials, paths, exception text or raw-frame/preview counts. Retained critical events after Last-Event-ID preserve IDs, timestamps and sessions with delivery=replay. Images are not retained and cannot evict pending critical events without closing the stream for replay. Replay never establishes current freshness or triggers energy. The shared 2048-event buffer is lost on restart; consumers preserve disconnected gaps outside retention. The desktop host owns durable access auditing: before start/manual capture/training it must verify storage, record attempts and outcomes, and stop/verify inactive on audit failure or transport loss; if stop remains active it must terminate the runtime. Coverage is sessions and explicit manual captures, not SDK-internal raw reads or standalone non-desktop access. No per-frame ACK protocol is provided."
       }
     },
     "/api/monitor/settings/status": {
@@ -700,6 +710,24 @@
   },
   "components": {
     "schemas": {
+      "RealSenseAccessEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "timestamp", "source", "sessionId", "operation", "outcome", "errorCode", "active", "coverage", "delivery"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^realsense-access-[0-9a-f-]{36}$"},
+          "timestamp": {"type": "integer", "minimum": 0},
+          "source": {"const": "realsense"},
+          "sessionId": {"type": "string", "format": "uuid"},
+          "operation": {"enum": ["session-stop", "stream-error"]},
+          "outcome": {"enum": ["success", "denied", "error"]},
+          "errorCode": {"enum": ["REALSENSE_STOPPED", "REALSENSE_PERMISSION_DENIED", "REALSENSE_STREAM_FAILED", "REALSENSE_STOP_FAILED"]},
+          "active": {"type": "boolean", "description": "True means shutdown was not confirmed; the host must retry or terminate the runtime, never report stopped."},
+          "coverage": {"const": "session"},
+          "delivery": {"enum": ["live", "replay"]}
+        },
+        "description": "Metadata-only lifecycle evidence. start/status return sessionId and accessCoverage=session-and-manual-capture. Start/capture permission failures use REALSENSE_PERMISSION_DENIED; other failures use REALSENSE_START_FAILED or REALSENSE_CAPTURE_FAILED; a sample discarded after stop uses REALSENSE_CANCELLED. Error messages are controlled, not raw SDK exceptions. Cached status/latest-frame reads create no access event."
+      },
       "RealSenseStartRequest": {
         "type": "object",
         "properties": {
@@ -907,8 +935,52 @@
             "additionalProperties": {
               "type": "string"
             }
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "transition",
+              "observation",
+              "boundary"
+            ]
+          },
+          "observedAt": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Fresh frame sample epoch milliseconds; equals timestamp. Boundary uses boundary time."
+          },
+          "stateChangedAt": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "First observation in this session, or latest state/source change. Stable observations retain this value."
+          },
+          "expectedIntervalMs": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Expected fresh inference cadence: ceil(1000 / min(focusFps, colorFps)); default 500 ms. Not a freshness guarantee."
+          },
+          "sessionId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "New UUID for every successful stream start; distinct from training session ID."
+          },
+          "delivery": {
+            "type": "string",
+            "enum": [
+              "live",
+              "replay"
+            ]
+          },
+          "boundary": {
+            "type": "string",
+            "enum": [
+              "stopped",
+              "disconnected"
+            ],
+            "description": "Present only for kind=boundary, whose state is unknown."
           }
-        }
+        },
+        "description": "Legacy records may omit observation fields. The attention-observation-heartbeat capability emits every successful fresh inference, plus explicit stopped/disconnected boundaries; polling cached previews never creates observations. No energy inference is provided."
       },
       "RealSenseFrame": {
         "type": "object",
@@ -1072,6 +1144,54 @@
             }
           }
         ]
+      },
+      "AttentionObservation": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AttentionRecord"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "observedAt",
+              "stateChangedAt",
+              "expectedIntervalMs",
+              "sessionId",
+              "delivery"
+            ],
+            "not": {
+              "required": [
+                "energy"
+              ]
+            },
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "boundary"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "boundary"
+              ],
+              "properties": {
+                "state": {
+                  "const": "unknown"
+                }
+              }
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "boundary"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Current provider attention.status payload. Legacy AttentionRecord remains accepted by consumers without assuming freshness."
       }
     }
   }

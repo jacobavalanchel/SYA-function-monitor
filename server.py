@@ -5,9 +5,11 @@ import http.server
 import array
 import hmac
 import json
+import math
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,7 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from realsense_runtime import EventBroker, FocusEstimator, encode_rgb_jpeg, utc_timestamp
+from realsense_runtime import ACCESS_COVERAGE, EventBroker, FocusEstimator, RealSenseActionError, access_error_code, critical_event_id, attention_observation, encode_rgb_jpeg, realsense_access_event, utc_timestamp
 
 STATIC_DIR = os.path.dirname(os.path.abspath(__file__))
 MODULE_ROOT = os.path.dirname(STATIC_DIR)
@@ -166,6 +168,7 @@ class RealSenseAdapter:
         self.latest_frame_data = None
         self.latest_raw_frame = None
         self.latest_attention = None
+        self.attention_session_id = str(uuid.uuid4())
         self.focus_detector = None
         self.worker = None
         self.stop_event = threading.Event()
@@ -475,6 +478,8 @@ class RealSenseAdapter:
             "backend": "pyrealsense2",
             "privilegeRequired": bool(sys.platform == "darwin" and usb_devices and not sdk_devices),
             "active": active,
+            "sessionId": self.attention_session_id,
+            "accessCoverage": ACCESS_COVERAGE,
             "startedAt": self.started_at,
             "totalFrames": self.total_frames,
             "totalSamples": self.total_samples,
@@ -605,6 +610,24 @@ class RealSenseAdapter:
         if record:
             EVENT_BROKER.publish("attention.status", record)
 
+    def _publish_access_boundary(self, operation, code):
+        EVENT_BROKER.publish("realsense.access", realsense_access_event(
+            self.attention_session_id, operation, code, self.active
+        ))
+
+    def _observation(self, sample, timestamp_ms, boundary=None):
+        # Called under the stream/lifecycle lock only after a completed sample
+        # or an explicit boundary. Cached reads never call this helper.
+        cadence = min(self.stream_config.get("focusFps", 2), self.stream_config.get("colorFps", 30))
+        return attention_observation(sample, self.latest_attention, self.attention_session_id,
+                                     math.ceil(1000 / max(1, cadence)), timestamp_ms, boundary)
+
+    def _boundary(self, boundary, reason):
+        sample = {"state": "unknown", "confidence": None, "source": "realsense-runtime",
+                  "reason": reason, "modelVersion": "runtime-1"}
+        self.latest_attention = self._observation(sample, int(time.time() * 1000), boundary)
+        self._publish_attention(self.latest_attention)
+
     def _stream_loop(self, pipeline, stop_event):
         last_preview_at = float("-inf")
         last_focus_at = float("-inf")
@@ -616,6 +639,8 @@ class RealSenseAdapter:
                     if stop_event.is_set():
                         break
                     raise RuntimeError(f"RealSense frame acquisition failed: {error}") from error
+                if stop_event.is_set():
+                    break
 
                 color_frame = frames.get_color_frame()
                 depth_frame = frames.get_depth_frame()
@@ -648,17 +673,18 @@ class RealSenseAdapter:
                         if self.focus_detector is not None
                         else False
                     )
-                attention_changed = False
+                observed = False
                 focus_interval = 1.0 / max(1, self.stream_config.get("focusFps", 2))
                 if (
                     color_bytes
                     and self.focus_detector is not None
                     and now_monotonic - last_focus_at >= focus_interval
                 ):
-                    attention, face_detected, attention_changed = self.focus_detector.analyze(
+                    attention, face_detected, _attention_changed = self.focus_detector.analyze(
                         color_bytes, color_width, color_height, timestamp_ms
                     )
                     last_focus_at = now_monotonic
+                    observed = True
 
                 jpeg_base64 = None
                 preview_interval = 1.0 / max(1, self.stream_config.get("previewFps", 2))
@@ -692,8 +718,12 @@ class RealSenseAdapter:
                 }
                 public_frame = None
                 with self.frame_condition:
-                    if self.pipeline is not pipeline:
+                    if self.pipeline is not pipeline or self.stop_event is not stop_event or stop_event.is_set():
                         break
+                    if observed and attention is not None:
+                        boundary = attention.get("boundary")
+                        observed_at = int(time.time() * 1000) if boundary else timestamp_ms
+                        attention = self._observation(attention, observed_at, boundary)
                     self.total_frames += 1
                     self.last_frame_time = captured_at
                     self.latest_raw_frame = raw_frame
@@ -725,34 +755,44 @@ class RealSenseAdapter:
                     CAMERA_STATE["lastFrameTime"] = timestamp_ms
                     CAMERA_STATE["faceDetected"] = bool(face_detected)
                     self.frame_condition.notify_all()
-
-                if attention_changed:
-                    self._publish_attention(attention)
-                if public_frame is not None:
-                    EVENT_BROKER.publish("realsense.frame", public_frame)
+                    # Stop cannot interleave between the ownership check and
+                    # publication. Only actual inference, not preview cadence,
+                    # creates an attention observation.
+                    if observed:
+                        self._publish_attention(attention)
+                    if public_frame is not None:
+                        EVENT_BROKER.publish("realsense.frame", public_frame)
         except Exception as error:
             error_message = str(error)
-            stop_event.set()
+            with self.lock:
+                cancelled = stop_event.is_set()
+                stop_event.set()
+            stopped = True
             try:
                 pipeline.stop()
             except Exception:
-                pass
+                stopped = False
             with self.lock:
-                self.last_error = error_message
-                if self.pipeline is pipeline:
+                if self.pipeline is pipeline and self.stop_event is stop_event:
+                    self.last_error = error_message
                     detector = self.focus_detector
-                    self.pipeline = None
-                    self.profile = None
+                    self.pipeline = None if stopped else pipeline
+                    if stopped:
+                        self.profile = None
                     self.worker = None
                     self.focus_detector = None
                     self.depth_scale = None
                     self.latest_frame_data = None
                     self.latest_raw_frame = None
-                    self.active = False
-                    CAMERA_STATE["isActive"] = False
+                    self.active = not stopped
+                    CAMERA_STATE["isActive"] = not stopped
                     CAMERA_STATE["faceDetected"] = False
-                    if CAMERA_STATE.get("source") == "realsense":
+                    if stopped and CAMERA_STATE.get("source") == "realsense":
                         CAMERA_STATE["source"] = "builtin"
+                    if not cancelled and (self.latest_attention or {}).get("boundary") != "stopped":
+                        self._boundary("disconnected", error_message)
+                        code = access_error_code(error, "REALSENSE_STREAM_FAILED") if stopped else "REALSENSE_STOP_FAILED"
+                        self._publish_access_boundary("stream-error" if stopped else "session-stop", code)
                     self.frame_condition.notify_all()
                 else:
                     detector = None
@@ -761,18 +801,6 @@ class RealSenseAdapter:
                     detector.close()
                 except Exception:
                     pass
-            record = {
-                "id": f"attention-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
-                "timestamp": int(time.time() * 1000),
-                "state": "unknown",
-                "confidence": None,
-                "source": "realsense-runtime",
-                "reason": error_message,
-                "modelVersion": "runtime-1",
-            }
-            with self.lock:
-                self.latest_attention = record
-            self._publish_attention(record)
 
     def latest_frame(self):
         with self.lock:
@@ -786,7 +814,12 @@ class RealSenseAdapter:
 
     def start(self, payload=None):
         with self.lifecycle_lock:
-            return self._start(payload)
+            try:
+                return self._start(payload)
+            except RealSenseActionError:
+                raise
+            except Exception as error:
+                raise RealSenseActionError(access_error_code(error, "REALSENSE_START_FAILED"), str(error)) from error
 
     def _start(self, payload=None):
         with self.lock:
@@ -887,8 +920,10 @@ class RealSenseAdapter:
                 config_values["depthFps"],
             )
 
+        started = False
         try:
             profile = pipeline.start(config)
+            started = True
             device = profile.get_device()
             device_info = self._device_info(device)
             depth_scale = None
@@ -917,6 +952,7 @@ class RealSenseAdapter:
                 self.latest_frame_data = None
                 self.latest_raw_frame = None
                 self.latest_attention = None
+                self.attention_session_id = str(uuid.uuid4())
                 self.focus_detector = detector
                 self.stop_event = stop_event
                 self.worker = worker
@@ -930,26 +966,36 @@ class RealSenseAdapter:
             worker.start()
             return self.status()
         except Exception as error:
+            stop_failed = False
             try:
                 pipeline.stop()
             except Exception:
-                pass
+                stop_failed = started
             if detector:
                 try:
                     detector.close()
                 except Exception:
                     pass
             with self.lock:
-                self.pipeline = None
+                self.pipeline = pipeline if stop_failed else None
                 self.profile = None
                 self.worker = None
                 self.focus_detector = None
                 self.depth_scale = None
-                self.active = False
+                self.active = stop_failed
+                if stop_failed:
+                    self.stop_event.set()
+                    CAMERA_STATE["isActive"] = True
+                    CAMERA_STATE["source"] = "realsense"
+                    self._publish_access_boundary("session-stop", "REALSENSE_STOP_FAILED")
                 self.last_error = self._inaccessible_usb_message() or str(error)
             raise RuntimeError(self.last_error) from error
 
     def stop(self, _payload=None):
+        # Signal before waiting for lifecycle work, using the same lock as the
+        # sample commit so stop cannot split its final check and publication.
+        with self.lock:
+            self.stop_event.set()
         with self.lifecycle_lock:
             return self._stop(_payload)
 
@@ -960,11 +1006,17 @@ class RealSenseAdapter:
             detector = self.focus_detector
             was_active = self.active or pipeline is not None
             self.stop_event.set()
+            self.latest_frame_data = None
+            self.latest_raw_frame = None
+            if was_active and (not self.latest_attention or self.latest_attention.get("boundary") != "stopped"):
+                self._boundary("stopped", "RealSense monitoring stopped.")
 
+        stop_failed = False
         if pipeline:
             try:
                 pipeline.stop()
             except Exception as error:
+                stop_failed = True
                 if not self.last_error:
                     self.last_error = str(error)
         if worker and worker is not threading.current_thread():
@@ -972,7 +1024,18 @@ class RealSenseAdapter:
             if worker.is_alive():
                 with self.lock:
                     self.last_error = "Timed out while stopping the RealSense acquisition worker."
+                    self.active = True
+                    CAMERA_STATE["isActive"] = True
+                    self._publish_access_boundary("session-stop", "REALSENSE_STOP_FAILED")
                 return self.status()
+        if stop_failed:
+            # The SDK may still own the camera. The host must not treat this as
+            # stopped; retain the handle for retry or terminate the runtime.
+            with self.lock:
+                self.active = True
+                CAMERA_STATE["isActive"] = True
+                self._publish_access_boundary("session-stop", "REALSENSE_STOP_FAILED")
+            return self.status()
         if detector:
             try:
                 detector.close()
@@ -994,21 +1057,9 @@ class RealSenseAdapter:
             if CAMERA_STATE.get("source") == "realsense":
                 CAMERA_STATE["source"] = "builtin"
             self.frame_condition.notify_all()
+            if was_active:
+                self._publish_access_boundary("session-stop", "REALSENSE_STOPPED")
 
-        if was_active:
-            timestamp_ms = int(time.time() * 1000)
-            record = {
-                "id": f"attention-{timestamp_ms}-{uuid.uuid4().hex[:8]}",
-                "timestamp": timestamp_ms,
-                "state": "unknown",
-                "confidence": None,
-                "source": "realsense-runtime",
-                "reason": "RealSense monitoring stopped.",
-                "modelVersion": "runtime-1",
-            }
-            with self.lock:
-                self.latest_attention = record
-            self._publish_attention(record)
         return self.status()
 
     def _depth_scale(self):
@@ -1080,6 +1131,14 @@ class RealSenseAdapter:
         }
 
     def capture(self, payload=None):
+        try:
+            return self._capture(payload)
+        except RealSenseActionError:
+            raise
+        except Exception as error:
+            raise RealSenseActionError(access_error_code(error, "REALSENSE_CAPTURE_FAILED"), str(error)) from error
+
+    def _capture(self, payload=None):
         payload = payload if isinstance(payload, dict) else {}
         start_if_needed = payload.get("startIfNeeded", True) is not False
         stop_after_capture = False
@@ -1093,6 +1152,8 @@ class RealSenseAdapter:
         if not isinstance(timeout_ms, int) or timeout_ms <= 0:
             timeout_ms = 5000
 
+        sample_dir = None
+        sample_created = False
         try:
             with self.frame_condition:
                 ready = self.frame_condition.wait_for(
@@ -1103,9 +1164,16 @@ class RealSenseAdapter:
                     raise RuntimeError("RealSense did not return color or depth frames before the capture timeout.")
                 raw_frame = dict(self.latest_raw_frame)
                 attention = dict(self.latest_attention) if self.latest_attention else None
+                session_stop = self.stop_event
 
+            def require_active_session():
+                if session_stop.is_set() or self.stop_event is not session_stop or not self.active:
+                    raise RealSenseActionError("REALSENSE_CANCELLED", "RealSense session stopped before the sample was committed.")
+
+            require_active_session()
             sample_id, sample_dir = self._sample_dir(payload)
-            os.makedirs(sample_dir, mode=0o700, exist_ok=True)
+            os.makedirs(sample_dir, mode=0o700, exist_ok=False)
+            sample_created = True
             captured_at = raw_frame["capturedAt"]
             result = {
                 "source": "realsense",
@@ -1120,6 +1188,7 @@ class RealSenseAdapter:
             }
 
             if raw_frame["colorBytes"]:
+                require_active_session()
                 result["color"] = self._write_color_ppm(
                     os.path.join(sample_dir, "color.ppm"),
                     raw_frame["colorWidth"],
@@ -1127,6 +1196,7 @@ class RealSenseAdapter:
                     raw_frame["colorBytes"],
                 )
             if raw_frame["depthBytes"]:
+                require_active_session()
                 result["depth"] = self._write_depth_pgm(
                     os.path.join(sample_dir, "depth.pgm"),
                     raw_frame["depthWidth"],
@@ -1135,16 +1205,27 @@ class RealSenseAdapter:
                 )
 
             metadata_path = os.path.join(sample_dir, "metadata.json")
+            require_active_session()
             metadata_body = (json.dumps(result, indent=2) + "\n").encode("utf-8")
             self._write_binary_atomic(metadata_path, metadata_body)
-            result["metadataPath"] = metadata_path
-
-            self.total_samples += 1
-            self.last_sample_path = sample_dir
-            CAMERA_STATE["storagePath"] = self._records_dir()
-            if self.training_session or payload.get("purpose") == "training":
-                EVENT_BROKER.publish("realsense.training.sample", result)
-            return result
+            # File writes remain cancellable outside the lock. The final check,
+            # sample bookkeeping and publication commit together against stop.
+            with self.lock:
+                require_active_session()
+                result["metadataPath"] = metadata_path
+                self.total_samples += 1
+                self.last_sample_path = sample_dir
+                CAMERA_STATE["storagePath"] = self._records_dir()
+                if self.training_session or payload.get("purpose") == "training":
+                    EVENT_BROKER.publish("realsense.training.sample", result)
+                return result
+        except Exception:
+            if sample_created:
+                try:
+                    shutil.rmtree(sample_dir)
+                except FileNotFoundError:
+                    pass
+            raise
         finally:
             if stop_after_capture:
                 self.stop()
@@ -1670,6 +1751,8 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._send_json(200, response(dispatch_action(action, payload=payload, query=query)))
         except KeyError:
             self._send_json(404, error_response("UNKNOWN_ACTION", f"Unknown monitor action: {action}"))
+        except RealSenseActionError as error:
+            self._send_json(500, error_response(error.code, error.public_message))
         except Exception as error:
             self._send_json(500, error_response("MONITOR_ACTION_ERROR", str(error)))
 
@@ -1687,14 +1770,14 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, config_status())
 
     def _send_event_stream(self):
-        subscriber = EVENT_BROKER.subscribe()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-        ready = json.dumps({"functionId": "monitor", "event": "ready", "payload": {}})
+        subscriber = EVENT_BROKER.subscribe(self.headers.get("Last-Event-ID"))
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            ready = json.dumps({"functionId": "monitor", "event": "ready", "payload": {}})
             self.wfile.write(f"event: ready\ndata: {ready}\n\n".encode())
             self.wfile.flush()
             while True:
@@ -1706,10 +1789,12 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     continue
                 event_name = message["event"]
                 event_body = json.dumps(message, separators=(",", ":"))
-                self.wfile.write(f"event: {event_name}\ndata: {event_body}\n\n".encode())
+                cursor = critical_event_id(message)
+                event_id = f"id: {cursor}\n" if cursor else ""
+                self.wfile.write(f"{event_id}event: {event_name}\ndata: {event_body}\n\n".encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+            self.close_connection = True
         finally:
             EVENT_BROKER.unsubscribe(subscriber)
 

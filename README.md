@@ -152,6 +152,47 @@ Five consecutive matching observations are required before focus state
 changes. Five consecutive no-face observations produce `away`; acquisition or
 inference failures fail closed to `unknown` and clear stale preview data.
 
+### MON-018 observation contract (source only)
+
+`attention.status` now emits a fresh record for every completed focus inference,
+including unchanged states. Each has a unique UUID-based `id`, `kind`
+(`transition`, `observation`, or `boundary`), `timestamp == observedAt` in epoch
+milliseconds, `stateChangedAt`, `expectedIntervalMs`, stream `sessionId`, and
+`delivery: "live"`. State/source changes update `stateChangedAt`; unchanged
+observations retain it. The first observation initializes it. Five-sample
+classification debounce still applies; each new sample during debounce is an
+observation of the current debounced state, not a fabricated new classification.
+
+The default `focusFps: 2` means an expected 500 ms interval (200 ms at 5 FPS).
+The declared interval is `ceil(1000 / min(focusFps, colorFps))`; hardware stalls
+are not hidden by repeating cached data. Reading status, cached previews, or
+capture metadata never advances observation time. A successful new stream start
+creates a fresh UUID session; training sessions are independent. Stops emit an
+unknown `boundary: "stopped"`; acquisition or inference failures emit unknown
+`boundary: "disconnected"`. No inference result may be published after its
+stream is stopped. There is no independent energy model and no `energy` field.
+
+These fields are optional on the legacy `AttentionRecord` schema for old
+artifacts, but required by `AttentionObservation` for this provider. Missing
+fields mean freshness cannot be inferred. SSE IDs match attention record IDs.
+The real and mock runtimes retain the latest **2,048 attention events** in memory;
+preview images are never retained for replay. A reconnect with `Last-Event-ID`
+replays only records strictly after a recognized retained ID, preserving IDs,
+timestamps and sessions with `delivery: "replay"`, before fresh live events.
+Absent, unknown, or evicted IDs start live only and do not imply full backfill.
+The buffer is lost on runtime restart; durable app history belongs to the host's
+SQLite store. Replayed observations must never refresh current state or trigger
+energy, and the host's disconnected boundary preserves gaps outside retention.
+HTTP authentication and process provenance boundaries are unchanged.
+
+The mock's explicit attention-status action represents one synthetic observation
+per call; repeated identical states produce distinct observations. Camera stop
+emits a boundary and camera restart begins a new session. It never runs an
+attention timer that re-stamps cached results. The TypeScript source adapter
+has no RealSense inference implementation and continues reporting unavailable;
+it cannot advertise or manufacture observation heartbeats. This source change
+has not updated any locked/distributed artifact or been verified on hardware.
+
 List sources and connected devices:
 
 ```ts

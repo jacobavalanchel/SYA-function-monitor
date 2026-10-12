@@ -19,6 +19,9 @@
     "function/monitor/patches/librealsense-v2.54.2-macos-l515.patch",
     "function/monitor/src/main.ts",
     "function/monitor/test_vision_support.py",
-    "function/monitor/HANDOVER.md"
+    "function/monitor/HANDOVER.md",
+    "function/monitor/api.openapi.json",
+    "function/monitor/mock/server.py",
+    "function/monitor/tests/test_server_realsense.py"
   ]
 }

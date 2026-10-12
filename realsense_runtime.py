@@ -1,13 +1,16 @@
 """Runtime helpers for RealSense preview events and local focus inference."""
 
 import base64
+import copy
+import errno
 from datetime import datetime, timezone
 import io
 import queue
+import re
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 
 
 LANDMARK_INDEX = {
@@ -40,6 +43,30 @@ ATTENTION_THRESHOLDS = {
 
 def utc_timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def attention_observation(sample, previous, session_id, expected_interval_ms, timestamp_ms, boundary=None):
+    """Stamp a completed inference or lifecycle boundary, never a cached poll."""
+    state = "unknown" if boundary else sample["state"]
+    changed = previous is None or previous.get("sessionId") != session_id or (previous["state"], previous["source"]) != (state, sample["source"])
+    record = {
+        key: sample[key] for key in ("confidence", "source", "reason", "modelVersion", "directions")
+        if key in sample
+    }
+    record.update({
+        "id": f"attention-{uuid.uuid4()}",
+        "timestamp": timestamp_ms,
+        "observedAt": timestamp_ms,
+        "state": state,
+        "stateChangedAt": timestamp_ms if changed else previous["stateChangedAt"],
+        "expectedIntervalMs": expected_interval_ms,
+        "sessionId": session_id,
+        "delivery": "live",
+        "kind": "boundary" if boundary else "transition" if changed else "observation",
+    })
+    if boundary:
+        record["boundary"] = boundary
+    return record
 
 
 def _ratio(first, middle, last):
@@ -151,17 +178,137 @@ def encode_rgb_jpeg(rgb_bytes, width, height, quality=72):
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
-class EventBroker:
-    """Small bounded fan-out queue used by the local SSE endpoint."""
+ACCESS_COVERAGE = "session-and-manual-capture"
+ACCESS_ERROR_MESSAGES = {
+    "REALSENSE_PERMISSION_DENIED": "RealSense device access was denied.",
+    "REALSENSE_START_FAILED": "RealSense session could not be started.",
+    "REALSENSE_CAPTURE_FAILED": "RealSense manual sample could not be captured.",
+    "REALSENSE_CANCELLED": "RealSense sample was discarded after the session stopped.",
+}
 
-    def __init__(self, queue_size=12):
-        self._queue_size = queue_size
+
+def access_error_code(error, fallback):
+    """Classify explicit OS/SDK permission failures without exposing their text."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, PermissionError) or getattr(error, "errno", None) in (errno.EACCES, errno.EPERM):
+            return "REALSENSE_PERMISSION_DENIED"
+        if re.search(r"permission denied|access (?:is )?denied|operation not permitted", str(error), re.IGNORECASE):
+            return "REALSENSE_PERMISSION_DENIED"
+        error = error.__cause__ or error.__context__
+    return fallback
+
+
+class RealSenseActionError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.public_message = ACCESS_ERROR_MESSAGES[code]
+
+
+def realsense_access_event(session_id, operation, error_code, active):
+    """Session boundary metadata only; never raw/preview frame accounting."""
+    allowed = {
+        ("session-stop", "REALSENSE_STOPPED", False),
+        ("session-stop", "REALSENSE_STOP_FAILED", True),
+        ("stream-error", "REALSENSE_PERMISSION_DENIED", False),
+        ("stream-error", "REALSENSE_STREAM_FAILED", False),
+    }
+    if (operation, error_code, active) not in allowed:
+        raise ValueError("Invalid RealSense access boundary.")
+    return {
+        "id": f"realsense-access-{uuid.uuid4()}", "timestamp": int(time.time() * 1000),
+        "source": "realsense", "sessionId": session_id, "operation": operation,
+        "outcome": "success" if error_code == "REALSENSE_STOPPED" else "denied" if error_code == "REALSENSE_PERMISSION_DENIED" else "error",
+        "errorCode": error_code, "active": bool(active), "coverage": "session", "delivery": "live",
+    }
+
+
+def critical_event_id(message):
+    """Only durable observation/access metadata advances SSE, never images."""
+    value = message.get("payload", {}).get("id") if message.get("event") in ("attention.status", "realsense.access") else None
+    return value if isinstance(value, str) and value and not any(char in value for char in "\0\r\n") else ""
+
+
+attention_event_id = critical_event_id  # Backwards-compatible Python helper import.
+
+
+class _EventSubscription:
+    def __init__(self, queue_size, replay):
+        self._live = queue.Queue(maxsize=queue_size)
+        self._replay = deque(replay)
+        self._lock = threading.Lock()
+        self._overflowed = False
+
+    def get(self, block=True, timeout=None):
+        with self._lock:
+            if self._overflowed:
+                raise ConnectionAbortedError("Critical event queue overflow; reconnect with Last-Event-ID.")
+            if self._replay:
+                return self._replay.popleft()
+        message = self._live.get(block=block, timeout=timeout)
+        with self._lock:
+            if self._overflowed:
+                raise ConnectionAbortedError("Critical event queue overflow; reconnect with Last-Event-ID.")
+            return message
+
+    def get_nowait(self):
+        return self.get(block=False)
+
+    def offer(self, message):
+        with self._lock:
+            if self._overflowed:
+                return
+            try:
+                self._live.put_nowait(message)
+            except queue.Full:
+                try:
+                    removed = self._live.get_nowait()
+                except queue.Empty:
+                    removed = None
+                if removed and critical_event_id(removed):
+                    # Never deliver a later cursor after losing an observation.
+                    # Close this bounded stream; the broker retains the missing
+                    # events for replay after the client's last durable cursor.
+                    self._overflowed = True
+                    while True:
+                        try:
+                            self._live.get_nowait()
+                        except queue.Empty:
+                            break
+                    self._live.put_nowait(None)  # Wake a blocked reader.
+                    return
+                self._live.put_nowait(message)
+
+
+class EventBroker:
+    """Bounded fan-out plus the latest 2,048 observation/access events for SSE resume.
+
+    A missing, unknown, or evicted cursor starts live only. The buffer does not
+    survive process restarts and never claims to recover gaps outside retention.
+    """
+
+    def __init__(self, queue_size=12, replay_size=2048):
+        self._queue_size = max(1, int(queue_size))
+        self._replay_size = max(0, int(replay_size))
+        self._retained = OrderedDict()
         self._subscribers = set()
         self._lock = threading.Lock()
 
-    def subscribe(self):
-        subscriber = queue.Queue(maxsize=self._queue_size)
+    def subscribe(self, last_event_id=None):
         with self._lock:
+            replay = []
+            if last_event_id and last_event_id in self._retained:
+                after_cursor = False
+                for event_id, message in self._retained.items():
+                    if after_cursor:
+                        recovered = copy.deepcopy(message)
+                        recovered["payload"]["delivery"] = "replay"
+                        replay.append(recovered)
+                    if event_id == last_event_id:
+                        after_cursor = True
+            subscriber = _EventSubscription(self._queue_size, replay)
             self._subscribers.add(subscriber)
         return subscriber
 
@@ -172,19 +319,17 @@ class EventBroker:
     def publish(self, event, payload):
         message = {"functionId": "monitor", "event": event, "payload": payload}
         with self._lock:
-            subscribers = list(self._subscribers)
-        for subscriber in subscribers:
-            try:
-                subscriber.put_nowait(message)
-            except queue.Full:
-                try:
-                    subscriber.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    subscriber.put_nowait(message)
-                except queue.Full:
-                    pass
+            event_id = critical_event_id(message)
+            if event_id and self._replay_size:
+                if event_id in self._retained:
+                    return
+                self._retained[event_id] = copy.deepcopy(message)
+                if len(self._retained) > self._replay_size:
+                    self._retained.popitem(last=False)
+            # Retention, snapshot, and live registration share a lock: an event
+            # is either replayed or queued live, never omitted at the boundary.
+            for subscriber in self._subscribers:
+                subscriber.offer(message)
 
 
 class FocusEstimator:
@@ -240,6 +385,10 @@ class FocusEstimator:
         )
         if not stable:
             if self.current is not None:
+                # A new frame was analyzed; retain the debounced state but not
+                # the previous sample's identity or observation timestamp.
+                self.current = self._record(self.current["state"], timestamp_ms,
+                                            self.current["reason"], self.current.get("directions"))
                 return self.current, False
             return self._record(
                 "unknown",
@@ -248,16 +397,16 @@ class FocusEstimator:
             ), False
 
         changed = self.current is None or self.current["state"] != candidate
-        if changed:
-            self.current = self._record(candidate, timestamp_ms, reason, directions)
+        self.current = self._record(candidate, timestamp_ms, reason, directions)
         return self.current, changed
 
     def analyze(self, rgb_bytes, width, height, timestamp_ms):
         if not self.available:
             record = self._record("unknown", timestamp_ms, self.error or "Focus inference is unavailable.")
             changed = self.current is None or self.current["reason"] != record["reason"]
-            if changed:
-                self.current = record
+            self.history.clear()
+            record["boundary"] = "disconnected"
+            self.current = record
             return self.current, False, changed
 
         try:
@@ -286,8 +435,9 @@ class FocusEstimator:
             self.error = f"Focus inference failed: {error}"
             record = self._record("unknown", timestamp_ms, self.error)
             changed = self.current is None or self.current["reason"] != record["reason"]
-            if changed:
-                self.current = record
+            self.history.clear()
+            record["boundary"] = "disconnected"
+            self.current = record
             return self.current, False, changed
 
     def close(self):

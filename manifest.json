@@ -27,7 +27,9 @@
     "realsense-rgbd-source",
     "live-camera-preview",
     "focus-inference",
-    "training-data-capture"
+    "training-data-capture",
+    "attention-observation-heartbeat",
+    "realsense-session-access-audit"
   ],
   "events": [
     "screen.capture",
@@ -36,7 +38,12 @@
     "camera.status",
     "realsense.frame",
     "realsense.training.sample",
+    "realsense.access",
     "attention.status"
   ],
-  "permissions": ["screen", "camera", "storage"]
+  "permissions": [
+    "screen",
+    "camera",
+    "storage"
+  ]
 }
