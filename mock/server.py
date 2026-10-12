@@ -11,9 +11,11 @@ Port: 8770 (or PORT env) — deliberately different from the real server (8765).
 from __future__ import annotations
 
 import http.server
+import hmac
 import json
 import os
 import queue
+import socketserver
 import sys
 import threading
 import time
@@ -31,6 +33,8 @@ DATA_PATH = os.path.join(MOCK_DIR, "data.json")
 MANIFEST_PATH = os.path.join(os.path.dirname(MOCK_DIR), "manifest.json")
 
 DEFAULT_PORT = 8770
+RUNTIME_TOKEN = os.environ.get("FUNCTION_RUNTIME_TOKEN", "").strip()
+RUNTIME_PROOF_KEY = os.environ.get("FUNCTION_RUNTIME_PROOF_KEY", "")
 MOCK_EXTRA_EVENTS = ["attention.status", "attention.config.status"]
 
 # ---------------------------------------------------------------------------
@@ -592,6 +596,17 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _request_authorized(self):
+        self._runtime_token_authenticated = False
+        if RUNTIME_TOKEN:
+            authorization = self.headers.get("Authorization", "")
+            if (not authorization.isascii() or not RUNTIME_TOKEN.isascii() or
+                    not hmac.compare_digest(authorization, f"Bearer {RUNTIME_TOKEN}")):
+                self._send_err(401, "UNAUTHORIZED", "Missing or invalid runtime token.")
+                return False
+            self._runtime_token_authenticated = True
+        return True
+
     # ----- CORS / preflight -----------------------------------------------
 
     def _cors(self):
@@ -612,6 +627,11 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self._cors()
         self.send_header("Content-Length", str(len(body)))
+        if (status == 200 and self.command == "GET" and
+                urllib.parse.urlparse(self.path).path == "/health" and
+                getattr(self, "_runtime_token_authenticated", False) and RUNTIME_PROOF_KEY):
+            proof = hmac.new(RUNTIME_PROOF_KEY.encode("utf-8"), b"sya-runtime-v1", digestmod="sha256").hexdigest()
+            self.send_header("X-SYA-Runtime-Proof", proof)
         self.end_headers()
         self.wfile.write(body)
 
@@ -641,6 +661,8 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
     # ----- Routing --------------------------------------------------------
 
     def do_GET(self):
+        if not self._request_authorized():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = dict(urllib.parse.parse_qsl(parsed.query))
@@ -672,6 +694,8 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
             self._send_ok(handler())
 
     def do_POST(self):
+        if not self._request_authorized():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
@@ -775,6 +799,11 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
 class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def server_bind(self):
+        # Keep startup independent of reverse DNS for the numeric loopback bind.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 # ---------------------------------------------------------------------------

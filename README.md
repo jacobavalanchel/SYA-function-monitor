@@ -84,6 +84,78 @@ Operational monitor endpoints:
 | `GET` | `/api/monitor/attention/config/status` | `attention.config.status` |
 | `GET` | `/api/monitor/events` | `events` |
 
+### Publisher runtime digests
+
+The producer can hash a staged, unpacked runtime with the same canonical format
+as the desktop consumer. Use Node.js 22.17.1 or newer; no additional package is
+required. Finish staging before hashing and keep the directory unchanged during
+the operation.
+
+```bash
+node scripts/hash-runtime.mjs /path/to/staged-runtime
+node scripts/hash-runtime.mjs /path/to/staged-runtime --json
+node scripts/hash-runtime.mjs /path/to/staged-runtime --archive /path/to/runtime.zip
+node tests/test_release_digest.mjs
+```
+
+The default output is the unpacked tree's hexadecimal SHA-256. `--json` emits
+`{"schemaVersion":1,"algorithm":"sya-runtime-tree-sha256-v1","runtimeSha256":"…"}`.
+`--archive` implies JSON and adds `sha256`, the SHA-256 of the supplied archive's
+bytes. Output goes only to stdout; the tool does not modify either input. Keep
+redirected output outside the staged directory. The publisher must separately
+ensure the archive actually contains that staged tree.
+
+`runtimeTreeSha256` is copied verbatim from SYA-UI's
+`scripts/hash-function-runtime.mjs` at commit
+`6c3366eed46e4af5751b90ae0706fe45dc4586d7`. The format walks directories recursively
+in NFC-normalized UTF-8 byte order and hashes fields as
+`label + NUL + decimal byte length + NUL + bytes`: `directory` for each directory
+path, then `file` and `content` for each file. Paths use `/` separators and NFC;
+empty directories participate. Modes and modification times do not participate.
+Only a regular root-level `artifact-provenance.json` is excluded, allowing
+consumer provenance to be added after verification. Producers must not include
+that file in the staged or archived runtime. The publisher API and all CLI modes
+reject its presence; only the shared canonical hash function applies the exclusion. Symbolic
+links, unsupported entries, and normalization-equivalent sibling names fail.
+The implementation uses Node's built-in
+[SHA-256 API](https://nodejs.org/download/release/v22.17.1/docs/api/crypto.html#cryptocreatehashalgorithm-options)
+and Unicode's established
+[NFC normalization](https://www.unicode.org/reports/tr15/), without a new hashing
+framework. Tests pin a fixed vector and compare the function and output with the
+parent consumer when this checkout is inside SYA-UI; that parity test is explicitly
+skipped in a standalone checkout.
+
+These values describe the supplied local bytes. They do not establish publisher
+identity, source revision, release approval, or authenticity. A trusted publishing
+workflow must bind the digests to its release metadata and provenance; generating
+them locally does not create that trust.
+
+### 已暂存服务的认证验证
+
+宿主为每次启动提供独立 `FUNCTION_RUNTIME_TOKEN` 与
+`FUNCTION_RUNTIME_PROOF_KEY`。真实服务和 mock 只对已经通过 token 认证的
+`GET /health` 返回 `X-SYA-Runtime-Proof`，值为
+`HMAC-SHA256(key, "sya-runtime-v1")` 的小写十六进制。
+未提供 proof key 时不返回此 header；无 token 的 standalone 保留原行为，
+但不能作为已认证宿主 runtime 的证据。mock attention_control.py 同样从该环境变量读取 token，
+仅向回环 HTTP 发送，禁用代理和重定向；未配置 token 时保留原 standalone 行为。所有声明 GET/POST/SSE 操作在 token
+模式下拒绝缺失或错误 token。health 的响应头已记录在 OpenAPI。
+
+```bash
+node scripts/test-staged-runtime.mjs /path/to/staged-runtime
+node tests/test_staged_runtime.mjs
+node tests/test_release_archives.mjs
+```
+
+此工具在 POSIX runner 启动 manifest 指定的 launcher，使用临时 HOME、空配置、
+独立 records 目录和随机端口，不继承发布或模型凭据。成功请求只覆盖 health、
+manifest、actions、screen status、latest frame 和立即取消的 SSE 握手；
+不调用会读取设备状态或启动采集的认证操作。验证结束或失败均有界清理进程，
+运行目录 digest 必须保持不变；动作发现须与 OpenAPI 对齐，状态/预览检查必需字段。
+workflow 将 smoke 输出保存于 stage 外，所有归档均解包核对同一已验证目录摘要，
+之后才生成外部双摘要元数据。它不验证硬件、模型结果或跨平台 binary；
+当前 wrapper 依赖外部 Python 的限制仍然存在。
+
 ## Intel RealSense Camera Source
 
 The monitor runtime can expose an Intel RealSense RGB-D camera as a camera data

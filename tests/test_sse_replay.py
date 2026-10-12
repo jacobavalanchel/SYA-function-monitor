@@ -221,7 +221,7 @@ class SseReplayTests(unittest.TestCase):
         broker = FiniteBroker()
         for i in range(3):
             broker.publish("attention.status", observation(i))
-        httpd = server.http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        httpd = server.ThreadedHTTPServer(("127.0.0.1", 0), Handler)
         worker = threading.Thread(target=httpd.serve_forever, daemon=True)
         connection = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=2)
         try:

@@ -2,19 +2,32 @@
   "openapi": "3.1.0",
   "info": {
     "title": "SYA Monitor Function API",
-    "version": "0.2.0"
+    "version": "0.2.0",
+    "description": "When FUNCTION_RUNTIME_TOKEN is configured at process startup, every declared operation (including SSE) requires Authorization: Bearer <token>. Missing, invalid or unsupported tokens receive 401 before dispatch. The empty security alternative applies only to standalone startup without a configured token; it is not an authentication bypass in token mode. The real runtime also enforces its loopback Host and standalone origin policy, returning 403 on rejection. Response bodies are unchanged between modes."
   },
+  "security": [{ "RuntimeBearer": [] }, {}],
   "paths": {
     "/health": {
       "get": {
         "operationId": "health",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Monitor function health",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            },
+            "headers": {
+              "X-SYA-Runtime-Proof": {
+                "description": "Only emitted after Bearer authentication when FUNCTION_RUNTIME_PROOF_KEY is configured. Lowercase HMAC-SHA256 of sya-runtime-v1 under the independent per-spawn proof key. Standalone or keyless health omits the header.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
                 }
               }
             }
@@ -26,6 +39,8 @@
       "get": {
         "operationId": "manifest",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Monitor function manifest",
             "content": {
@@ -43,6 +58,8 @@
       "get": {
         "operationId": "actions.list",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Callable monitor action list",
             "content": {
@@ -60,6 +77,8 @@
       "get": {
         "operationId": "capabilities.list",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Monitor capabilities, events, permissions, and actions",
             "content": {
@@ -96,6 +115,8 @@
           }
         },
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Invoked monitor action result",
             "content": {
@@ -113,6 +134,8 @@
       "get": {
         "operationId": "screen.status",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Current screen monitor status",
             "content": {
@@ -146,6 +169,8 @@
           }
         },
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Started screen monitoring",
             "content": {
@@ -163,6 +188,8 @@
       "post": {
         "operationId": "screen.stop",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Stopped screen monitoring",
             "content": {
@@ -180,6 +207,8 @@
       "get": {
         "operationId": "camera.status",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Current camera monitor status",
             "content": {
@@ -238,6 +267,8 @@
           }
         },
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Started camera monitoring",
             "content": {
@@ -255,6 +286,8 @@
       "post": {
         "operationId": "camera.stop",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Stopped camera monitoring",
             "content": {
@@ -272,6 +305,8 @@
       "post": {
         "operationId": "camera.show",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Showed the camera monitor window",
             "content": {
@@ -289,6 +324,8 @@
       "post": {
         "operationId": "camera.hide",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Hid the camera monitor window",
             "content": {
@@ -306,6 +343,8 @@
       "get": {
         "operationId": "camera.sources",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Available camera data sources",
             "content": {
@@ -323,6 +362,8 @@
       "get": {
         "operationId": "realsense.status",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Intel RealSense adapter status",
             "content": {
@@ -340,6 +381,8 @@
       "get": {
         "operationId": "realsense.devices",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Connected Intel RealSense devices",
             "content": {
@@ -380,6 +423,8 @@
           }
         },
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Started Intel RealSense streaming",
             "content": {
@@ -397,6 +442,8 @@
       "post": {
         "operationId": "realsense.stop",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Stopped Intel RealSense streaming",
             "content": {
@@ -440,6 +487,8 @@
           }
         },
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Captured a RealSense RGB/depth sample",
             "content": {
@@ -459,6 +508,8 @@
         "summary": "Read the latest RealSense preview frame",
         "description": "Returns the latest bounded in-memory JPEG preview and focus result, or null before the first frame. No preview file is written to disk.",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Latest RealSense preview frame",
             "content": {
@@ -498,6 +549,8 @@
           }
         },
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Started a RealSense training data capture session",
             "content": {
@@ -530,6 +583,8 @@
           }
         },
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Stopped the active RealSense training data capture session",
             "content": {
@@ -547,6 +602,8 @@
       "get": {
         "operationId": "storage.stats",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Monitor storage statistics",
             "content": {
@@ -575,6 +632,8 @@
           }
         ],
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Stored screen records",
             "content": {
@@ -603,6 +662,8 @@
           }
         ],
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Stored camera records",
             "content": {
@@ -620,6 +681,8 @@
       "get": {
         "operationId": "attention.config.status",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Attention LLM configuration status",
             "content": {
@@ -646,6 +709,8 @@
           }
         ],
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Monitor server-sent events stream",
             "content": {
@@ -665,6 +730,8 @@
         "operationId": "settings.status",
         "summary": "Read monitor settings",
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Persisted monitor settings status",
             "content": {
@@ -694,6 +761,8 @@
           }
         },
         "responses": {
+          "401": { "$ref": "#/components/responses/RuntimeUnauthorized" },
+          "403": { "$ref": "#/components/responses/RuntimeForbidden" },
           "200": {
             "description": "Saved monitor settings status",
             "content": {
@@ -709,6 +778,33 @@
     }
   },
   "components": {
+    "securitySchemes": {
+      "RuntimeBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Required for every operation when FUNCTION_RUNTIME_TOKEN is non-empty at startup. Standalone mode without that token permits unauthenticated requests subject to runtime access policy. The token and the independent process proof key must never be returned or logged."
+      }
+    },
+    "responses": {
+      "RuntimeUnauthorized": {
+        "description": "Token-authenticated mode: missing, invalid or unsupported Authorization header; no operation is dispatched and no process proof is emitted.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/FunctionResponse" },
+            "example": { "ok": false, "error": { "code": "UNAUTHORIZED", "message": "Missing or invalid runtime token." } }
+          }
+        }
+      },
+      "RuntimeForbidden": {
+        "description": "Request rejected by the real runtime loopback Host or standalone origin policy before dispatch; no process proof is emitted.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/FunctionResponse" },
+            "example": { "ok": false, "error": { "code": "FORBIDDEN", "message": "Monitor runtime accepts loopback requests only." } }
+          }
+        }
+      }
+    },
     "schemas": {
       "RealSenseAccessEvent": {
         "type": "object",

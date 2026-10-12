@@ -8,13 +8,16 @@ to the mock API, and the server emits an SSE event to connected UI clients.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
+import os
 import select
 import sys
 import termios
 import time
 import tty
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -26,7 +29,37 @@ KEYMAP = {
 }
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _authenticated_base_url(base_url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        host = "127.0.0.1" if parsed.hostname == "localhost" else parsed.hostname
+        if (parsed.scheme != "http" or not host or parsed.username is not None or
+                parsed.password is not None or parsed.query or parsed.fragment or
+                not ipaddress.ip_address(host).is_loopback):
+            raise ValueError
+        port = parsed.port or 80
+        authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        return urllib.parse.urlunsplit(("http", authority, parsed.path, "", ""))
+    except ValueError:
+        raise urllib.error.URLError("Authenticated control requires a loopback HTTP base URL without credentials, query or fragment.") from None
+
+
 def _post_status(base_url: str, status: str, confidence: float) -> dict:
+    token = os.environ.get("FUNCTION_RUNTIME_TOKEN", "").strip()
+    headers = {"Content-Type": "application/json"}
+    open_request = urllib.request.urlopen
+    if token:
+        base_url = _authenticated_base_url(base_url)
+        if not token.isascii():
+            raise urllib.error.URLError("Runtime token must be ASCII.")
+        headers["Authorization"] = f"Bearer {token}"
+        # No proxy or redirect may forward the per-runtime secret elsewhere.
+        open_request = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
     payload = {
         "attentionStatus": status,
         "confidence": confidence,
@@ -37,10 +70,10 @@ def _post_status(base_url: str, status: str, confidence: float) -> dict:
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/monitor/mock/attention/status",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=3) as response:
+    with open_request(request, timeout=3) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

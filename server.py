@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import shutil
+import socketserver
 import subprocess
 import sys
 import threading
@@ -40,6 +41,7 @@ SUPPORTED_L515_FIRMWARE = "1.5.8.1"
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
 PUBLIC_ASSET_PATHS = {"/", "/index.html", "/face_landmarker.task"}
 RUNTIME_TOKEN = os.environ.get("FUNCTION_RUNTIME_TOKEN", "").strip()
+RUNTIME_PROOF_KEY = os.environ.get("FUNCTION_RUNTIME_PROOF_KEY", "")
 
 ACTION_DEFINITIONS = [
     {"action": "health", "method": "GET", "path": "/health", "description": "Check monitor runtime health."},
@@ -1608,6 +1610,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=STATIC_DIR, **kwargs)
 
     def _request_authorized(self):
+        self._runtime_token_authenticated = False
         host = self.headers.get("Host", "")
         hostname = host.rsplit(":", 1)[0].strip("[]").lower()
         if hostname not in {"127.0.0.1", "localhost", "::1"}:
@@ -1616,9 +1619,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
         if RUNTIME_TOKEN:
             authorization = self.headers.get("Authorization", "")
-            if not hmac.compare_digest(authorization, f"Bearer {RUNTIME_TOKEN}"):
+            if (not authorization.isascii() or not RUNTIME_TOKEN.isascii() or
+                    not hmac.compare_digest(authorization, f"Bearer {RUNTIME_TOKEN}")):
                 self._send_json(401, error_response("UNAUTHORIZED", "Missing or invalid runtime token."))
                 return False
+            self._runtime_token_authenticated = True
             return True
 
         if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
@@ -1743,6 +1748,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if (status_code == 200 and self.command == "GET" and
+                urllib.parse.urlparse(self.path).path == "/health" and
+                getattr(self, "_runtime_token_authenticated", False) and RUNTIME_PROOF_KEY):
+            proof = hmac.new(RUNTIME_PROOF_KEY.encode("utf-8"), b"sya-runtime-v1", digestmod="sha256").hexdigest()
+            self.send_header("X-SYA-Runtime-Proof", proof)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1848,10 +1858,18 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
 
+class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer's reverse-DNS lookup can stall even for numeric loopback.
+        # TCPServer retains normal socket setup and resolves an ephemeral port.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 if __name__ == "__main__":
     port = resolve_port()
     api_config = load_api_config()
-    with http.server.ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler) as httpd:
+    with ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler) as httpd:
         httpd.daemon_threads = True
         print(f"Serving on http://127.0.0.1:{port}")
         print(f"Static files from: {STATIC_DIR}")

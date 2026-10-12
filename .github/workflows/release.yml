@@ -29,7 +29,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22.12.0"
+          node-version: "22.17.1"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -70,6 +70,12 @@ jobs:
         run: |
           python -m pip install Pillow==11.3.0
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -m unittest discover -s tests -v
+
+      - name: Test release validation tools
+        run: |
+          node tests/test_release_digest.mjs
+          node tests/test_staged_runtime.mjs
+          node tests/test_release_archives.mjs
 
       - name: Validate release contract files
         run: |
@@ -127,103 +133,17 @@ jobs:
           test -x release/stage/scripts/realsense-l515
           test -f release/stage/patches/librealsense-v2.54.2-macos-l515.patch
 
-      - name: Smoke test staged runtime API
-        shell: bash
-        run: |
-          set -euo pipefail
-          export PORT=9876
-          ./release/stage/bin/monitor-server > release/monitor-smoke.log 2>&1 &
-          server_pid="$!"
-          cleanup() {
-            kill "${server_pid}" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-
-          node --input-type=module <<'NODE'
-          import { readFileSync } from 'node:fs';
-
-          const baseUrl = 'http://127.0.0.1:9876';
-          const openApi = JSON.parse(readFileSync('release/stage/api.openapi.json', 'utf8'));
-
-          function responseContent(operation) {
-            return operation.responses?.['200']?.content || {};
-          }
-
-          function isEventStream(operation) {
-            return Boolean(responseContent(operation)['text/event-stream']);
-          }
-
-          function requestBodyFor(operation) {
-            const requestBody = operation.requestBody;
-            if (!requestBody) return undefined;
-            const schema = requestBody.content?.['application/json']?.schema;
-            if (Array.isArray(schema?.required) && schema.required.length > 0) return null;
-            return {};
-          }
-
-          function discoverTests() {
-            const tests = [];
-            for (const [path, pathItem] of Object.entries(openApi.paths || {})) {
-              if (path.includes('{') || path.includes('}')) continue;
-              for (const method of ['get']) {
-                const operation = pathItem?.[method];
-                if (!operation) continue;
-                if (isEventStream(operation)) continue;
-                if (!responseContent(operation)['application/json']) continue;
-                const body = method === 'post' ? requestBodyFor(operation) : undefined;
-                if (body === null) continue;
-                tests.push({
-                  method: method.toUpperCase(),
-                  path,
-                  body,
-                  expectEnvelope: path !== '/manifest',
-                });
-              }
-            }
-            return tests;
-          }
-
-          async function waitForHealth() {
-            const deadline = Date.now() + 10000;
-            let lastError;
-            while (Date.now() < deadline) {
-              try {
-                const response = await fetch(`${baseUrl}/health`);
-                if (response.ok) return;
-              } catch (error) {
-                lastError = error;
-              }
-              await new Promise((resolve) => setTimeout(resolve, 250));
-            }
-            throw new Error(`monitor runtime did not become healthy: ${lastError?.message || 'timeout'}`);
-          }
-
-          await waitForHealth();
-          const tests = discoverTests();
-          if (tests.length === 0) throw new Error('api.openapi.json has no testable JSON endpoints');
-          for (const test of tests) {
-            const init = { method: test.method };
-            if (test.body !== undefined) {
-              init.headers = { 'Content-Type': 'application/json' };
-              init.body = JSON.stringify(test.body);
-            }
-            const response = await fetch(`${baseUrl}${test.path}`, init);
-            if (!response.ok) {
-              throw new Error(`${test.method} ${test.path} returned HTTP ${response.status}`);
-            }
-            const body = await response.json();
-            if (test.expectEnvelope && body.ok !== true) {
-              throw new Error(`${test.method} ${test.path} did not return a successful FunctionResponse envelope`);
-            }
-          }
-          console.log(`OpenAPI smoke tested ${tests.length} endpoints.`);
-          NODE
+      - name: Smoke test authenticated staged runtime
+        run: node scripts/test-staged-runtime.mjs release/stage > release/smoke-result.json
 
       - name: Create platform archives
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.meta.outputs.version }}"
+          runtime_sha256="$(node -p "JSON.parse(require('fs').readFileSync('release/smoke-result.json', 'utf8')).runtimeSha256")"
+          [[ "${runtime_sha256}" =~ ^[a-f0-9]{64}$ ]]
+          test "${runtime_sha256}" = "$(node scripts/hash-runtime.mjs release/stage)"
           platforms=(
             "macos-arm64:zip"
             "macos-x64:zip"
@@ -239,7 +159,17 @@ jobs:
             else
               tar -czf "release/out/${name}" -C release/stage .
             fi
+            verify_dir="release/verify/${platform}"
+            mkdir -p "${verify_dir}"
+            if [[ "${ext}" == "zip" ]]; then
+              unzip -q "release/out/${name}" -d "${verify_dir}"
+            else
+              tar -xzf "release/out/${name}" -C "${verify_dir}"
+            fi
+            test "${runtime_sha256}" = "$(node scripts/hash-runtime.mjs "${verify_dir}")"
+            node scripts/hash-runtime.mjs release/stage --archive "release/out/${name}" > "release/out/${name}.digests.json"
           done
+          test "${runtime_sha256}" = "$(node scripts/hash-runtime.mjs release/stage)"
           (cd release/out && sha256sum * > SHA256SUMS.txt)
 
       - name: Publish GitHub Release
@@ -251,6 +181,8 @@ jobs:
             Runtime artifacts for the SYA monitor function.
 
             Each archive contains manifest.json, api.openapi.json, bin/, assets/, README.md, and compiled adapter output.
+            Each external .digests.json records archive SHA-256 and the canonical sya-runtime-tree-sha256-v1 digest.
+            Consumers must independently recompute both digests before reviewing a lock update.
           files: release/out/*
           fail_on_unmatched_files: true
           make_latest: false
