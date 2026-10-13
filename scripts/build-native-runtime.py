@@ -30,7 +30,7 @@ SDK_PINS = {
     "patchSha256": "eb3acdba968cb716133a176a0051af7d06568594cd3b1d8a65f6d3b1202317c1",
 }
 SOURCE_FILES = (
-    "server.py", "realsense_runtime.py", "startup_trace.py", "index.html", "config.example.json",
+    "server.py", "realsense_runtime.py", "eye_observation.py", "startup_trace.py", "index.html", "config.example.json",
     "manifest.json", "module.json", "api.openapi.json", "package.json",
     "packaging/native_entry.py", "packaging/native_self_test.py", "packaging/native_tls.py",
     "packaging/native_inputs.py", "packaging/startup_hook.py", "packaging/monitor.spec",

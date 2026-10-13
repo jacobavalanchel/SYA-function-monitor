@@ -320,6 +320,84 @@ has no RealSense inference implementation and continues reporting unavailable;
 it cannot advertise or manufacture observation heartbeats. This source change
 has not updated any locked/distributed artifact or been verified on hardware.
 
+### FOC-011 eye observations (internal, source only)
+
+The RealSense source now reuses the same fresh-frame FaceMesh result to measure
+left/right eye aspect ratio (EAR) and eye width in image-pixel coordinates.
+`eye_observation.py` retains only scalar observations in a session-owned memory
+window: 60 seconds, at most 600 samples, with a maximum adjacent-frame gap of
+`2 / min(focusFps, colorFps)` seconds. These are operational bounds, not calibrated
+energy thresholds. Attention classification, sampling rates, public HTTP/SSE
+payloads and the prohibition on `energy` remain unchanged.
+
+Actual color-frame identity and host acquisition monotonic time determine
+ordering; inference completion time is separate, and acquisition UTC is metadata.
+Host acquisition time is not sensor exposure time. Missing/repeated/out-of-order
+identities, invalid geometry and excessive gaps break continuity. Stops, failures
+and new sessions clear previous samples and continuity; an inference failure may
+then be retained as an invalid observation. Same-session resets preserve ordering
+watermarks. An old worker cannot append to or clear a newer session. Snapshot
+coverage uses only proven adjacent valid intervals, clips them
+to the configured duration and never extends beyond the last observation. One
+older anchor may be retained within the sample limit but is excluded from sample
+counts and EAR distributions. Capacity truncation is reported explicitly.
+Snapshot endpoints must not move backward within a session; requests for pruned
+history fail explicitly. An incoherent acquisition/completion clock pair cannot
+advance retention time or the offline evaluator's default report endpoint.
+
+EAR is uncalibrated geometry. Coverage describes sampling continuity, not image
+quality, eye closure, single-person presence or identity continuity.
+`max_num_faces=1` does not prove that only one person is present, and this API has
+no per-eye quality confidence. No images or landmarks are stored by this window,
+and this change adds no collection, upload, model dependency or public capability.
+`extractor_version` identifies the fixed landmark-contour/EAR algorithm. It does
+not attest to the installed MediaPipe version or an injected processor's identity;
+actual processor, model and authorized-data provenance still need separate evidence.
+
+The offline evaluator accepts explicit schema-1 JSONL and a versioned
+configuration. Run from the Monitor repository or staged package root with Python
+3.11 or newer; the staged CLI loads its pure module from `assets/`:
+
+```sh
+python3.11 scripts/evaluate-eye-observations.py \
+  --config CONFIG.json --input OBSERVATIONS.jsonl --as-of-monotonic-s 100.5
+```
+
+`CONFIG.json`:
+
+```json
+{"schema_version":1,"extractor_version":"mediapipe-face-mesh-0.10.21-ear-v1","session_id":"synthetic","duration_seconds":2,"max_samples":20,"max_gap_seconds":1}
+```
+
+`OBSERVATIONS.jsonl` (two deliberately synthetic samples):
+
+```jsonl
+{"schema_version":1,"session_id":"synthetic","color_frame_number":1,"captured_at_ms":100000,"acquired_monotonic_s":100,"completed_monotonic_s":100.05,"geometry":{"schema_version":1,"extractor_version":"mediapipe-face-mesh-0.10.21-ear-v1","width":640,"height":480,"left_ear":0.2,"right_ear":0.25,"left_width_px":40,"right_width_px":40,"reason":null}}
+{"schema_version":1,"session_id":"synthetic","color_frame_number":2,"captured_at_ms":100500,"acquired_monotonic_s":100.5,"completed_monotonic_s":100.55,"geometry":{"schema_version":1,"extractor_version":"mediapipe-face-mesh-0.10.21-ear-v1","width":640,"height":480,"left_ear":0.2,"right_ear":0.25,"left_width_px":40,"right_width_px":40,"reason":null}}
+```
+
+The report has `valid_samples: 2`, `coverage_seconds: 0.5`,
+`coverage_ratio: 0.25` and `valid_sample_rate_hz: 1`. Both ratio/rate denominators
+are the configured two-second window; they are not a model confidence or a claim
+that the short trace sustained one frame per second. The report also includes
+invalid reason counts, interval/latency/EAR distributions and capacity flags.
+`reason_counts` records each rejected sample's first failing validation, so it
+does not enumerate every issue present in that sample. `interval_seconds`
+contains only proven adjacent valid intervals intersecting the window; rejected
+observations and continuity gaps are excluded, so it is not an exhaustive
+acquisition-cadence distribution.
+Configuration is bounded to 16 KiB, each JSONL line to 64 KiB and offline capacity
+to 100,000 samples. Unknown fields/versions, invalid numbers and malformed input
+fail with a nonzero exit and only a fixed `{line,code}` error on stderr; no partial
+success report is written. Finite but unusable observations instead contribute
+quality rejection reasons without resetting the configured session.
+
+Synthetic geometry, stream-lifecycle, offline-input and packaging tests validate
+this source foundation. Real model accuracy, authorized-data provenance and
+evaluation, complete acquisition-cadence and image-quality evaluation, actual
+camera performance and packaged production behavior remain unverified; FOC-011
+remains Partial. No production artifact lock is changed.
+
 List sources and connected devices:
 
 ```ts

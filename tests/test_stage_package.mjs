@@ -9,7 +9,7 @@ function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-stage-recipe-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const directory of ['scripts', 'patches', 'dist', 'release/out']) fs.mkdirSync(path.join(root, directory), { recursive: true });
-  for (const name of ['manifest.json', 'api.openapi.json', 'README.md', 'package.json', 'module.json', 'index.html', 'server.py', 'realsense_runtime.py', 'config.example.json', 'requirements-realsense.txt', 'dist/main.js', 'patches/librealsense-v2.54.2-macos-l515.patch']) {
+  for (const name of ['manifest.json', 'api.openapi.json', 'README.md', 'package.json', 'module.json', 'index.html', 'server.py', 'realsense_runtime.py', 'eye_observation.py', 'config.example.json', 'requirements-realsense.txt', 'dist/main.js', 'patches/librealsense-v2.54.2-macos-l515.patch']) {
     fs.writeFileSync(path.join(root, name), `fixture:${name}`);
   }
   fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ type: 'commonjs' }));
@@ -38,10 +38,50 @@ test('shared recipe stages from its own source root and preserves external prove
   assert.equal(result.error, undefined); assert.equal(result.status, 0, result.stderr);
   const stage = path.join(root, 'release/stage');
   assert.equal(fs.readFileSync(path.join(stage, 'assets/server.py'), 'utf8'), 'fixture:server.py');
+  assert.equal(fs.readFileSync(path.join(stage, 'assets/eye_observation.py'), 'utf8'), 'fixture:eye_observation.py');
   assert.equal(fs.readFileSync(path.join(stage, 'dist/main.js'), 'utf8'), 'fixture:dist/main.js');
   fs.accessSync(path.join(stage, 'bin/monitor-server'), fs.constants.X_OK);
   assert.match(fs.readFileSync(path.join(stage, 'bin/monitor-server.cmd'), 'utf8'), /MONITOR_PYTHON/);
   assert.equal(fs.readFileSync(path.join(root, 'release/out/source-provenance.json'), 'utf8'), 'external provenance');
+});
+
+test('staged eye evaluator runs the real CLI with only its packaged module and synthetic input', t => {
+  const { root, script } = fixture(t);
+  for (const name of ['eye_observation.py', 'scripts/evaluate-eye-observations.py']) {
+    fs.copyFileSync(new URL(`../${name}`, import.meta.url), path.join(root, name));
+  }
+  const tracked = spawnSync('git', ['add', 'scripts/evaluate-eye-observations.py'], { cwd: root, encoding: 'utf8' });
+  assert.equal(tracked.status, 0, tracked.stderr);
+  const staged = run(script);
+  assert.equal(staged.error, undefined);
+  assert.equal(staged.status, 0, staged.stderr);
+  const stage = path.join(root, 'release/stage');
+  const extractorVersion = 'mediapipe-face-mesh-0.10.21-ear-v1';
+  const config = { schema_version: 1, extractor_version: extractorVersion, session_id: 'synthetic',
+    duration_seconds: 2, max_samples: 20, max_gap_seconds: 1 };
+  const geometry = { schema_version: 1, extractor_version: extractorVersion, width: 640, height: 480,
+    left_ear: 0.2, right_ear: 0.25, left_width_px: 40, right_width_px: 40, reason: null };
+  const rows = [100, 100.5].map((time, index) => ({ schema_version: 1, session_id: 'synthetic',
+    color_frame_number: index + 1, captured_at_ms: time * 1000, acquired_monotonic_s: time,
+    completed_monotonic_s: time + 0.05, geometry }));
+  const configPath = path.join(root, 'synthetic-config.json');
+  const inputPath = path.join(root, 'synthetic-observations.jsonl');
+  fs.writeFileSync(configPath, JSON.stringify(config));
+  fs.writeFileSync(inputPath, rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+  assert.equal(fs.existsSync(path.join(stage, 'eye_observation.py')), false);
+  // Isolated Python and an unrelated cwd prevent source/PYTHONPATH fallback.
+  const result = spawnSync(process.env.MONITOR_PYTHON || 'python3', [
+    '-I', '-B', path.join(stage, 'scripts/evaluate-eye-observations.py'),
+    '--config', configPath, '--input', inputPath, '--as-of-monotonic-s', '100.5',
+  ], { cwd: os.tmpdir(), encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.valid_samples, 2);
+  assert.equal(report.coverage_seconds, 0.5);
+  assert.equal(report.coverage_ratio, 0.25);
+  assert.equal(report.valid_sample_rate_hz, 1);
 });
 
 test('shared recipe excludes untracked source and non-entry generated files', t => {

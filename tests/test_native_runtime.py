@@ -137,15 +137,16 @@ class NativeBuildBoundaryTests(unittest.TestCase):
                         pass
 
     def test_snapshot_binds_live_contracts_lock_and_provenance_without_private_files(self):
+        self.assertIn("eye_observation.py", builder.SOURCE_FILES)
         with tempfile.TemporaryDirectory() as temporary:
             root, output = Path(temporary) / "source", Path(temporary) / "output"
             root.mkdir()
-            for name in ("server.py", "manifest.json", "private-config.json"):
+            for name in ("server.py", "eye_observation.py", "manifest.json", "private-config.json"):
                 (root / name).write_text(name)
             lock, provenance = root / "lock", root / "sdk.json"
             lock.write_text("same-version old-hash")
             provenance.write_text("sdk")
-            with mock.patch.object(builder, "ROOT", root), mock.patch.object(builder, "SOURCE_FILES", ("server.py", "manifest.json")):
+            with mock.patch.object(builder, "ROOT", root), mock.patch.object(builder, "SOURCE_FILES", ("server.py", "eye_observation.py", "manifest.json")):
                 snapshot, bindings, digest = builder.source_snapshot(output, lock, provenance, Path(sys.executable).resolve())
                 self.assertFalse((snapshot / "private-config.json").exists())
                 self.assertEqual(len(digest), 64)
@@ -153,7 +154,7 @@ class NativeBuildBoundaryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "file set changed"):
                     builder.verify_input_bindings(snapshot, bindings)
                 (snapshot / "private-config.json").unlink()
-                for changed in (root / "server.py", root / "manifest.json", lock, provenance):
+                for changed in (root / "server.py", root / "eye_observation.py", root / "manifest.json", lock, provenance):
                     original = changed.read_bytes()
                     changed.write_bytes(original + b" mutation")
                     with self.assertRaisesRegex(RuntimeError, "Live build input changed"):
@@ -317,7 +318,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
             output = Path(temporary)
             stage = output / "stage"
             (stage / "bin").mkdir(parents=True)
-            for name in ("manifest.json", "module.json", "api.openapi.json", "package.json", "server.py", "realsense_runtime.py"):
+            for name in ("manifest.json", "module.json", "api.openapi.json", "package.json", "server.py", "realsense_runtime.py", "eye_observation.py"):
                 shutil.copyfile(ROOT / name, stage / name)
             # Reproduce the review mutation on the real entry source. The fake
             # diagnostic intentionally passes; only the service smoke can catch it.

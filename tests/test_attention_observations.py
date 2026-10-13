@@ -13,6 +13,7 @@ import server
 from realsense_runtime import EventBroker, FocusEstimator, attention_observation
 from test_realsense_runtime import FakeNumpy, FakeProcessor, centered_landmarks
 from test_server_realsense import FakeFrameSet, BrokenPipeline, FakeDetector
+from eye_observation import invalid_eye_geometry
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("monitor_mock_heartbeat", ROOT / "mock/server.py")
@@ -25,13 +26,15 @@ class FramesPipeline:
         self.adapter = adapter
         self.remaining = count
         self.stopped = False
+        self.frame_number = 40
 
     def wait_for_frames(self, _timeout):
         if not self.remaining:
             self.adapter.stop_event.set()
             raise RuntimeError("test input ended")
         self.remaining -= 1
-        return FakeFrameSet()
+        self.frame_number += 1
+        return FakeFrameSet(self.frame_number)
 
     def stop(self):
         self.stopped = True
@@ -85,7 +88,7 @@ class ObservationTests(unittest.TestCase):
         adapter = self.adapter(5)
         face = type("Face", (), {"landmark": centered_landmarks()})()
         adapter.focus_detector = FocusEstimator(history_size=1, processor=FakeProcessor([face]), numpy_module=FakeNumpy())
-        with mock.patch.object(server.time, "monotonic", side_effect=[0, .1, .5, .6, 1]), mock.patch.object(
+        with mock.patch.object(server.time, "monotonic", side_effect=[0, .01, .1, .5, .51, .6, 1, 1.01]), mock.patch.object(
             server.time, "time", side_effect=[1, 1.1, 1.5, 1.6, 2]
         ):
             adapter._stream_loop(adapter.pipeline, adapter.stop_event)
@@ -182,8 +185,9 @@ class ObservationTests(unittest.TestCase):
             entered.set()
             if not release.wait(2):
                 raise RuntimeError("test release timeout")
-            return {"state": "focused", "source": "realsense-face-mesh", "confidence": None, "reason": "test"}, True, True
-        detector.analyze = analyze
+            return ({"state": "focused", "source": "realsense-face-mesh", "confidence": None, "reason": "test"},
+                    True, True, invalid_eye_geometry("missing_landmarks", 2, 1))
+        detector.analyze_frame = analyze
         adapter.focus_detector = detector
         worker = threading.Thread(target=adapter._stream_loop, args=(adapter.pipeline, adapter.stop_event))
         adapter.worker = worker
@@ -206,6 +210,7 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(records[0]["boundary"], "stopped")
         self.assertIsNone(adapter.latest_frame_data)
         self.assertIsNone(adapter.latest_raw_frame)
+        self.assertEqual(adapter.eye_window.snapshot(0)["retained_samples"], 0)
 
     def test_successful_restart_gets_new_session_and_idempotent_start_does_not(self):
         adapter = server.RealSenseAdapter()
@@ -229,6 +234,8 @@ class ObservationTests(unittest.TestCase):
             adapter.start()
             self.assertNotEqual(adapter.attention_session_id, first_session)
             self.assertIsNone(adapter.latest_attention)
+            self.assertEqual(adapter.eye_window.session_id, adapter.attention_session_id)
+            self.assertEqual(adapter.eye_window.snapshot(0)["retained_samples"], 0)
             adapter.stop()
 
     def test_expected_interval_follows_focus_and_color_cadence(self):

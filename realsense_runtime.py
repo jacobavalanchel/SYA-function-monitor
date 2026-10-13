@@ -12,6 +12,8 @@ import time
 import uuid
 from collections import OrderedDict, deque
 
+from eye_observation import invalid_eye_geometry, measure_eye_geometry
+
 
 LANDMARK_INDEX = {
     "left_eye_outer": 33,
@@ -401,13 +403,19 @@ class FocusEstimator:
         return self.current, changed
 
     def analyze(self, rgb_bytes, width, height, timestamp_ms):
+        """Compatibility wrapper for callers consuming only attention."""
+        return self.analyze_frame(rgb_bytes, width, height, timestamp_ms)[:3]
+
+    def analyze_frame(self, rgb_bytes, width, height, timestamp_ms):
+        """Run FaceMesh once and extract independent in-memory eye scalars."""
+        geometry = invalid_eye_geometry("inference_failed", width, height)
         if not self.available:
             record = self._record("unknown", timestamp_ms, self.error or "Focus inference is unavailable.")
             changed = self.current is None or self.current["reason"] != record["reason"]
             self.history.clear()
             record["boundary"] = "disconnected"
             self.current = record
-            return self.current, False, changed
+            return self.current, False, changed, geometry
 
         try:
             image = self._numpy.frombuffer(rgb_bytes, dtype=self._numpy.uint8).reshape(
@@ -419,8 +427,12 @@ class FocusEstimator:
                 record, changed = self.observe(
                     "away", timestamp_ms, "No face was detected in the RealSense color frame."
                 )
-                return record, False, changed
+                return record, False, changed, invalid_eye_geometry("no_face", width, height)
 
+            # Geometry validation is independent of attention classification:
+            # unusable eye contours must not turn successful attention into a
+            # failure or trigger a second FaceMesh pass.
+            geometry = measure_eye_geometry(faces[0].landmark, width, height)
             state, directions, _ratios = classify_attention_landmarks(faces[0].landmark)
             reason = (
                 "Face and iris direction remained within the configured focus bounds."
@@ -430,7 +442,7 @@ class FocusEstimator:
                 + "."
             )
             record, changed = self.observe(state, timestamp_ms, reason, directions)
-            return record, True, changed
+            return record, True, changed, geometry
         except Exception as error:
             self.error = f"Focus inference failed: {error}"
             record = self._record("unknown", timestamp_ms, self.error)
@@ -438,7 +450,7 @@ class FocusEstimator:
             self.history.clear()
             record["boundary"] = "disconnected"
             self.current = record
-            return self.current, False, changed
+            return self.current, False, changed, invalid_eye_geometry("inference_failed", width, height)
 
     def close(self):
         close = getattr(self._processor, "close", None)

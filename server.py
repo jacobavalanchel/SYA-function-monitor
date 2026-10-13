@@ -22,6 +22,7 @@ import urllib.request
 import uuid
 
 from realsense_runtime import ACCESS_COVERAGE, EventBroker, FocusEstimator, RealSenseActionError, access_error_code, critical_event_id, attention_observation, encode_rgb_jpeg, realsense_access_event, utc_timestamp
+from eye_observation import EyeObservation, EyeObservationWindow, EyeWindowConfig
 
 STATIC_DIR = os.path.dirname(os.path.abspath(__file__))
 MODULE_ROOT = os.path.dirname(STATIC_DIR)
@@ -199,6 +200,16 @@ class RealSenseAdapter:
             "serial": "",
         }
         self.training_session = None
+        self.eye_window = self._new_eye_window()
+
+    def _new_eye_window(self):
+        # Operational memory/cadence bounds, never energy-model thresholds.
+        cadence = min(self.stream_config["focusFps"], self.stream_config["colorFps"])
+        window = EyeObservationWindow(EyeWindowConfig(
+            duration_seconds=60.0, max_samples=600, max_gap_seconds=2.0 / max(1, cadence)
+        ))
+        window.reset(self.attention_session_id)
+        return window
 
     def _load_sdk(self):
         if self.rs is not None:
@@ -595,12 +606,23 @@ class RealSenseAdapter:
         )
 
     def _frame_number(self, frame):
+        # Preserve the public preview's historical fallback, while internal
+        # eye identity distinguishes missing identity from legitimate frame 0.
         if not frame:
             return 0
         try:
             return int(frame.get_frame_number())
         except Exception:
             return 0
+
+    def _color_frame_number(self, frame):
+        if not frame:
+            return None
+        try:
+            number = frame.get_frame_number()
+            return number if isinstance(number, int) and not isinstance(number, bool) and number >= 0 else None
+        except Exception:
+            return None
 
     def _validate_frame_bytes(self, label, data, width, height, bytes_per_pixel):
         expected = width * height * bytes_per_pixel
@@ -637,6 +659,11 @@ class RealSenseAdapter:
         last_focus_at = float("-inf")
         try:
             while not stop_event.is_set():
+                with self.lock:
+                    if self.pipeline is not pipeline or self.stop_event is not stop_event:
+                        break
+                    detector = self.focus_detector
+                    session_id = self.attention_session_id
                 try:
                     frames = pipeline.wait_for_frames(1000)
                 except Exception as error:
@@ -661,6 +688,7 @@ class RealSenseAdapter:
                 color_bytes = bytes(color_frame.get_data()) if color_frame else None
                 depth_bytes = bytes(depth_frame.get_data()) if depth_frame else None
                 frame_number = self._frame_number(color_frame or depth_frame)
+                color_frame_number = self._color_frame_number(color_frame)
                 color_width = color_frame.get_width() if color_frame else 0
                 color_height = color_frame.get_height() if color_frame else 0
                 depth_width = depth_frame.get_width() if depth_frame else 0
@@ -678,14 +706,20 @@ class RealSenseAdapter:
                         else False
                     )
                 observed = False
+                eye_observation = None
                 focus_interval = 1.0 / max(1, self.stream_config.get("focusFps", 2))
                 if (
                     color_bytes
-                    and self.focus_detector is not None
+                    and detector is not None
                     and now_monotonic - last_focus_at >= focus_interval
                 ):
-                    attention, face_detected, _attention_changed = self.focus_detector.analyze(
+                    attention, face_detected, _attention_changed, geometry = detector.analyze_frame(
                         color_bytes, color_width, color_height, timestamp_ms
+                    )
+                    eye_observation = EyeObservation(
+                        session_id=session_id, color_frame_number=color_frame_number,
+                        captured_at_ms=timestamp_ms, acquired_monotonic_s=now_monotonic,
+                        completed_monotonic_s=time.monotonic(), geometry=geometry,
                     )
                     last_focus_at = now_monotonic
                     observed = True
@@ -726,6 +760,8 @@ class RealSenseAdapter:
                         break
                     if observed and attention is not None:
                         boundary = attention.get("boundary")
+                        if eye_observation is not None:
+                            self.eye_window.observe(eye_observation)
                         observed_at = int(time.time() * 1000) if boundary else timestamp_ms
                         attention = self._observation(attention, observed_at, boundary)
                     self.total_frames += 1
@@ -778,6 +814,7 @@ class RealSenseAdapter:
                 stopped = False
             with self.lock:
                 if self.pipeline is pipeline and self.stop_event is stop_event:
+                    self.eye_window.reset()
                     self.last_error = error_message
                     detector = self.focus_detector
                     self.pipeline = None if stopped else pipeline
@@ -831,6 +868,7 @@ class RealSenseAdapter:
                 raise RuntimeError("RealSense runtime is shutting down.")
             if self.active:
                 return self.status()
+            self.eye_window.reset()
 
         rs = self._load_sdk()
         config_values = self._read_stream_config(payload)
@@ -959,6 +997,7 @@ class RealSenseAdapter:
                 self.latest_raw_frame = None
                 self.latest_attention = None
                 self.attention_session_id = str(uuid.uuid4())
+                self.eye_window = self._new_eye_window()
                 self.focus_detector = detector
                 self.stop_event = stop_event
                 self.worker = worker
@@ -987,6 +1026,7 @@ class RealSenseAdapter:
                 self.profile = None
                 self.worker = None
                 self.focus_detector = None
+                self.eye_window.reset()
                 self.depth_scale = None
                 self.active = stop_failed
                 if stop_failed:
@@ -1002,6 +1042,7 @@ class RealSenseAdapter:
         # sample commit so stop cannot split its final check and publication.
         with self.lock:
             self.stop_event.set()
+            self.eye_window.reset()
         with self.lifecycle_lock:
             return self._stop(_payload)
 
@@ -1010,6 +1051,7 @@ class RealSenseAdapter:
         with self.lock:
             self._shutting_down = True
             self.stop_event.set()
+            self.eye_window.reset()
         with self.lifecycle_lock:
             return self._stop(include_status=False)
 
@@ -1020,6 +1062,7 @@ class RealSenseAdapter:
             detector = self.focus_detector
             was_active = self.active or pipeline is not None
             self.stop_event.set()
+            self.eye_window.reset()
             self.latest_frame_data = None
             self.latest_raw_frame = None
             if was_active and (not self.latest_attention or self.latest_attention.get("boundary") != "stopped"):

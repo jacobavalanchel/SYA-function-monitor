@@ -36,7 +36,7 @@ cp manifest.json api.openapi.json README.md package.json module.json "${stage_ro
 for entry in main renderer types; do
   cp "dist/${entry}.js" "dist/${entry}.d.ts" "${stage_root}/dist/"
 done
-cp index.html server.py realsense_runtime.py config.example.json "${stage_root}/assets/"
+cp index.html server.py realsense_runtime.py eye_observation.py config.example.json "${stage_root}/assets/"
 cp requirements-realsense.txt "${stage_root}/"
 # 只复制版本控制中的源码，忽略 untracked/ignored helper 或凭据文件。
 git ls-files -z -- scripts patches | while IFS= read -r -d '' source_file; do
@@ -79,5 +79,6 @@ test -x "${stage_root}/bin/monitor-server"
 test -f "${stage_root}/bin/monitor-server.cmd"
 test -d "${stage_root}/assets"
 test -f "${stage_root}/assets/realsense_runtime.py"
+test -f "${stage_root}/assets/eye_observation.py"
 test -x "${stage_root}/scripts/realsense-l515"
 test -f "${stage_root}/patches/librealsense-v2.54.2-macos-l515.patch"

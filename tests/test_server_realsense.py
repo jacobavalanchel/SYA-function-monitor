@@ -29,9 +29,9 @@ class FakeFrame:
 
 
 class FakeFrameSet:
-    def __init__(self):
-        self.color = FakeFrame(bytes([255, 0, 0, 0, 255, 0]), 2, 1, 41)
-        self.depth = FakeFrame(bytes([1, 0, 2, 0]), 2, 1, 41)
+    def __init__(self, frame_number=41):
+        self.color = FakeFrame(bytes([255, 0, 0, 0, 255, 0]), 2, 1, frame_number)
+        self.depth = FakeFrame(bytes([1, 0, 2, 0]), 2, 1, frame_number)
 
     def get_color_frame(self):
         return self.color
@@ -97,6 +97,12 @@ class FakeDetector:
 
     def close(self):
         self.closed = True
+
+    def analyze_frame(self, _rgb, width, height, timestamp_ms):
+        from eye_observation import invalid_eye_geometry
+        return ({"state": "focused", "source": "realsense-face-mesh", "confidence": None,
+                 "timestamp": timestamp_ms, "reason": "synthetic"},
+                True, True, invalid_eye_geometry("missing_landmarks", width, height))
 
 
 class RealSenseAdapterTests(unittest.TestCase):
