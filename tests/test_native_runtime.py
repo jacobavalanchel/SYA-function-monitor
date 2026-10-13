@@ -39,6 +39,14 @@ self_test = load("native_self_test_tests", "packaging/native_self_test.py")
 server = load("native_server_tests", "server.py")
 
 
+def capture_and_log(method):
+    def run(self):
+        for logged in (False, True):
+            with self.subTest(logged=logged):
+                method(self, logged)
+    return run
+
+
 class NativeBuildBoundaryTests(unittest.TestCase):
     def resistant_child_command(self, root, *, exit_leader=False):
         witness = root / "owned-pids.json"
@@ -51,7 +59,8 @@ class NativeBuildBoundaryTests(unittest.TestCase):
             " while True: time.sleep(1)\n"
             "else:\n"
             " while not pathlib.Path(sys.argv[1] + '.ready').exists(): time.sleep(0.01)\n"
-            " pathlib.Path(sys.argv[1]).write_text(json.dumps({'leader':os.getpid(),'child':child}))\n"
+            " pathlib.Path(sys.argv[1] + '.tmp').write_text(json.dumps({'leader':os.getpid(),'child':child}))\n"
+            " pathlib.Path(sys.argv[1] + '.tmp').replace(sys.argv[1])\n"
             + (" sys.exit(0)\n" if exit_leader else " time.sleep(30)\n")
         )
         return [sys.executable, "-c", code, str(witness), "sya-native-owned-fixture"], witness
@@ -60,30 +69,41 @@ class NativeBuildBoundaryTests(unittest.TestCase):
         pids = json.loads(witness.read_text())
         self.assertFalse(builder.process_group_exists(pids["leader"]))
 
-    def test_timeout_kills_logged_resistant_descendant_after_leader_exits(self):
+    @capture_and_log
+    def test_timeout_kills_logged_resistant_descendant_after_leader_exits(self, logged):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             command, witness = self.resistant_child_command(root)
             env = builder.isolated_environment(root / "home", root / "tmp")
+            lifecycle = {}
             with self.assertRaisesRegex(RuntimeError, "deadline"):
-                builder.run_bounded(command, env=env, cwd=root, timeout=0.3, log=root / "child.log")
+                builder.run_bounded(command, env=env, cwd=root, timeout=0.3, log=root / "child.log" if logged else None, lifecycle=lifecycle)
             self.assert_group_gone(witness)
+            if not logged:
+                self.assertTrue(lifecycle["pipesDrained"])
 
-    def test_normal_leader_exit_also_cleans_unfinished_descendant(self):
+    @capture_and_log
+    def test_normal_leader_exit_also_cleans_unfinished_descendant(self, logged):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             command, witness = self.resistant_child_command(root, exit_leader=True)
             env = builder.isolated_environment(root / "home", root / "tmp")
+            lifecycle = {}
             with self.assertRaisesRegex(RuntimeError, "descendants"):
-                builder.run_bounded(command, env=env, cwd=root, timeout=5, log=root / "child.log")
+                builder.run_bounded(command, env=env, cwd=root, timeout=5, log=root / "child.log" if logged else None, lifecycle=lifecycle)
             self.assert_group_gone(witness)
+            if not logged:
+                self.assertTrue(lifecycle["pipesDrained"])
 
-    def test_keyboard_interrupt_cleans_detached_process_group(self):
+    @capture_and_log
+    def test_keyboard_interrupt_cleans_detached_process_group(self, logged):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             command, witness = self.resistant_child_command(root)
             env = builder.isolated_environment(root / "home", root / "tmp")
-            communicate = subprocess.Popen.communicate
+            lifecycle = {}
+            wait_method = "communicate" if logged else "wait"
+            communicate = getattr(subprocess.Popen, wait_method)
             interrupted = False
 
             def interrupt_once(process, *args, **kwargs):
@@ -97,23 +117,28 @@ class NativeBuildBoundaryTests(unittest.TestCase):
                     raise KeyboardInterrupt()
                 return communicate(process, *args, **kwargs)
 
-            with mock.patch.object(subprocess.Popen, "communicate", interrupt_once):
+            with mock.patch.object(subprocess.Popen, wait_method, interrupt_once):
                 with self.assertRaises(KeyboardInterrupt):
-                    builder.run_bounded(command, env=env, cwd=root, timeout=10, log=root / "child.log")
+                    builder.run_bounded(command, env=env, cwd=root, timeout=10, log=root / "child.log" if logged else None, lifecycle=lifecycle)
             self.assert_group_gone(witness)
+            if not logged:
+                self.assertTrue(lifecycle["pipesDrained"])
 
-    def test_cli_sigterm_enters_child_cleanup(self):
+    @capture_and_log
+    def test_cli_sigterm_enters_child_cleanup(self, logged):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             command, witness = self.resistant_child_command(root)
             env = builder.isolated_environment(root / "home", root / "tmp")
+            lifecycle = {}
             code = (
                 "import importlib.util,json,sys\n"
                 "s=importlib.util.spec_from_file_location('builder',sys.argv[1]); b=importlib.util.module_from_spec(s); s.loader.exec_module(b)\n"
-                "command=json.loads(sys.argv[2]); root=sys.argv[3]\n"
-                "b.build=lambda args: b.run_bounded(command,env=b.isolated_environment(root+'/inner-home',root+'/inner-tmp'),cwd=root,timeout=60,log=root+'/child.log')\n"
+                "command=json.loads(sys.argv[2]); root=sys.argv[3]; lifecycle={}\n"
+                f"b.build=lambda args: b.run_bounded(command,env=b.isolated_environment(root+'/inner-home',root+'/inner-tmp'),cwd=root,timeout=60,log=(root+'/child.log' if {logged!r} else None),lifecycle=lifecycle)\n"
                 "sys.argv=['builder','--output',root+'/unused','--sdk-provenance',root+'/unused','--node-executable',root+'/unused','--wheelhouse',root+'/unused']\n"
-                "b.main()\n"
+                "try: b.main()\n"
+                "finally: b.Path(root+'/lifecycle.json').write_text(json.dumps(lifecycle))\n"
             )
             process = subprocess.Popen([sys.executable, "-c", code, str(ROOT / "scripts/build-native-runtime.py"),
                                         json.dumps(command), str(root)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -126,6 +151,8 @@ class NativeBuildBoundaryTests(unittest.TestCase):
                 _output, error = process.communicate(timeout=12)
                 self.assertEqual(process.returncode, 128 + signal.SIGTERM, error.decode())
                 self.assert_group_gone(witness)
+                if not logged:
+                    self.assertTrue(json.loads((root / "lifecycle.json").read_text())["pipesDrained"])
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -163,6 +190,137 @@ class NativeBuildBoundaryTests(unittest.TestCase):
                 (snapshot / "server.py").write_text("mutated copy")
                 with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
                     builder.verify_input_bindings(snapshot, bindings)
+
+    def test_diagnostic_options_bound_independently_and_strictly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            lock, sdk = output / "lock", output / "sdk"
+            lock.write_text("lock")
+            sdk.write_text("sdk")
+            snapshot, bindings, _ = builder.source_snapshot(output, lock, sdk, Path(sys.executable).resolve(), "bootloader-importtime")
+            self.assertEqual(json.loads((snapshot / "inputs/build-options.json").read_text()),
+                             {"schemaVersion": 1, "startupDiagnostics": "bootloader-importtime"})
+            live = Path(bindings["inputs/build-options.json"]["path"])
+            frozen = snapshot / "inputs/build-options.json"
+            self.assertNotEqual(live, frozen)
+            original = live.read_bytes()
+            live.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "Live build input changed"):
+                builder.verify_input_bindings(snapshot, bindings)
+            live.write_bytes(original)
+            reduced = {key: value for key, value in bindings.items() if key != "scripts/startup-diagnostics.mjs"}
+            with self.assertRaisesRegex(RuntimeError, "file set changed"):
+                builder.verify_input_bindings(snapshot, reduced)
+            with self.assertRaises(ValueError):
+                builder.build_options("imports")
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for shared diagnostic parser")
+    def test_selftest_failure_retains_only_structured_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            executable = output / "fake-native"
+            executable.write_text("#!" + sys.executable + "\nimport sys\nsys.stderr.write('[PYI-123:DEBUG] LOADER: process level = 1\\nimport time: 20 | 30 | ssl\\nPRIVATE_LEAK_SENTINEL\\n')\nsys.exit(1)\n")
+            executable.chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, "Native validation failed") as failure:
+                builder.verify_candidate(executable, output, 5, node=Path(shutil.which("node")).resolve(),
+                                         snapshot=ROOT, mode="bootloader-importtime")
+            text = (output / "selftest-startup-original.json").read_text()
+            self.assertNotIn("PRIVATE_LEAK_SENTINEL", text + str(failure.exception))
+            record = json.loads(text)
+            self.assertEqual(record["status"], "failed")
+            self.assertEqual(record["startupDiagnostics"]["events"][-1]["module"], "ssl")
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for shared diagnostic parser")
+    def test_selftest_contract_failure_is_failed_and_success_is_passed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            node = Path(shutil.which("node")).resolve()
+            for payload in ({"ok": False}, {"ok": True, "frozen": True},
+                            {"ok": True, "frozen": True, "nativeLibraries": {"checked": True}}):
+                with mock.patch.object(builder, "run_bounded", return_value=json.dumps(payload)):
+                    if payload.get("nativeLibraries"):
+                        result = builder.verify_candidate(output / "unused", output, 5, node=node, snapshot=ROOT)
+                        self.assertEqual(result["status"], "passed")
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            builder.verify_candidate(output / "unused", output, 5, node=node, snapshot=ROOT)
+                evidence = json.loads((output / "selftest-startup-original.json").read_text())
+                self.assertEqual(evidence["status"], "passed" if payload.get("nativeLibraries") else "failed")
+
+    def test_reader_failure_closes_streams_and_fails_without_raw_text(self):
+        class Broken(io.BytesIO):
+            def read1(self, _size):
+                raise OSError("PRIVATE_READER_SENTINEL")
+        stdout, stderr = Broken(), io.BytesIO(b"")
+        child = types.SimpleNamespace(pid=123, stdout=stdout, stderr=stderr, returncode=0, wait=lambda **kwargs: 0)
+        state = {}
+        with mock.patch.object(builder.subprocess, "Popen", return_value=child), mock.patch.object(builder, "wait_owned_group", return_value=True):
+            with self.assertRaises(builder.NativeValidationError) as failure:
+                builder.run_bounded_capture([], env={}, cwd=".", timeout=1, lifecycle=state)
+        self.assertEqual(failure.exception.code, "reader")
+        self.assertTrue(stdout.closed and stderr.closed)
+        self.assertEqual(state["readerFailures"], ["stdout_read"])
+        self.assertNotIn("PRIVATE_READER_SENTINEL", json.dumps(state) + str(failure.exception))
+
+    def test_cleanup_failure_preserves_nonzero_and_actual_byte_counts(self):
+        child = types.SimpleNamespace(pid=123, stdout=io.BytesIO(b"ok"), stderr=io.BytesIO(b"x" * (4 * 1024 * 1024 + 100)), returncode=7, wait=lambda **kwargs: 7)
+        state, chunks = {}, []
+        with mock.patch.object(builder.subprocess, "Popen", return_value=child), mock.patch.object(builder, "cleanup_owned_group", side_effect=RuntimeError("PRIVATE_CLEANUP_SENTINEL")):
+            with self.assertRaises(builder.NativeValidationError) as failure:
+                builder.run_bounded_capture([], env={}, cwd=".", timeout=1, lifecycle=state, stderr_chunks=chunks)
+        self.assertEqual(failure.exception.code, "nonzero")
+        self.assertEqual(state["cleanupFailure"], "cleanup")
+        self.assertEqual(state["receivedBytes"]["stderr"], 4 * 1024 * 1024 + 100)
+        self.assertEqual(state["omittedBytes"]["stderr"], 100)
+        self.assertEqual(state["deadlineMs"], 1000)
+        self.assertGreaterEqual(state["elapsedMs"], 0)
+        self.assertTrue(state["pipesDrained"])
+        self.assertNotIn("PRIVATE_CLEANUP_SENTINEL", json.dumps(state) + str(failure.exception))
+
+    def test_parser_failure_still_persists_original_failure_and_lifecycle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            def failed_run(*args, **kwargs):
+                kwargs["lifecycle"].update({"pid": 123, "cleanup": "group_gone", "failure": "nonzero"})
+                raise builder.NativeValidationError("nonzero")
+            with mock.patch.object(builder, "run_bounded", side_effect=failed_run), mock.patch.object(builder, "parse_diagnostics", side_effect=RuntimeError("PRIVATE_PARSER_SENTINEL")):
+                with self.assertRaises(builder.NativeValidationError) as failure:
+                    builder.verify_candidate(Path(temporary) / "unused", temporary, 1, node="unused", snapshot=ROOT, mode="bootloader-importtime")
+            record = json.loads((Path(temporary) / "selftest-startup-original.json").read_text())
+            self.assertEqual(failure.exception.code, "nonzero")
+            self.assertEqual(record["failure"], "nonzero")
+            self.assertEqual(record["parserFailure"], "parser")
+            self.assertEqual(record["lifecycle"]["cleanup"], "group_gone")
+            self.assertNotIn("PRIVATE_PARSER_SENTINEL", json.dumps(record))
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for shared diagnostic coverage")
+    def test_diagnostic_selftest_requires_debug_and_importtime_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            payload = {"ok": True, "frozen": True, "nativeLibraries": {"checked": True}}
+            with mock.patch.object(builder, "run_bounded", return_value=json.dumps(payload)):
+                with self.assertRaises(builder.NativeValidationError) as failure:
+                    builder.verify_candidate(output / "unused", output, 1, node=Path(shutil.which("node")).resolve(),
+                                             snapshot=ROOT, mode="bootloader-importtime")
+            self.assertEqual(failure.exception.code, "coverage")
+            record = json.loads((output / "selftest-startup-original.json").read_text())
+            self.assertEqual(record["status"], "failed")
+            self.assertFalse(record["startupDiagnostics"]["coverage"]["ok"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for shared HTTP diagnostic coverage")
+    def test_diagnostic_http_requires_debug_and_importtime_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "scripts").mkdir()
+            (output / "inputs").mkdir()
+            (output / "inputs/build-options.json").write_text(json.dumps(builder.build_options("bootloader-importtime")))
+            shutil.copyfile(ROOT / "scripts/startup-diagnostics.mjs", output / "scripts/startup-diagnostics.mjs")
+            (output / "scripts/test-staged-runtime.mjs").write_text("export async function testStagedRuntime() { return { runtimeSha256: 'a'.repeat(64), sseHandshake:true, authenticatedOperations:29, startupTrace:{status:'complete'} }; }")
+            with self.assertRaises(RuntimeError):
+                builder.verify_http_stage(output, output, Path(shutil.which("node")).resolve(), output,
+                                          invocation="original", expected_stage_digest="a" * 64)
+            evidence = json.loads(next(output.glob("http-startup-*.json")).read_text())
+            self.assertEqual(evidence["status"], "failed")
+            self.assertEqual(evidence["error"], "Native diagnostic coverage failed.")
 
     def test_node_and_wheelhouse_must_be_explicit_absolute_inputs(self):
         for directory in (False, True):
@@ -229,7 +387,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
                         + json.dumps({"runtimeSha256": "a" * 64, "sseHandshake": True,
                                       "authenticatedOperations": 29, "startupTrace": {"status": status}})
                         + "; }")
-                    with self.assertRaisesRegex(RuntimeError, "trace is not complete"):
+                    with self.assertRaisesRegex(RuntimeError, "Native validation failed"):
                         builder.verify_http_stage(output, output, Path(shutil.which("node")).resolve(), snapshot,
                                                   invocation="relocated", expected_stage_digest="a" * 64)
             records = [json.loads(file.read_text()) for file in output.glob("http-startup-*.json")]
@@ -334,7 +492,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
             if (ROOT / "packaging/native_tls.py").is_file():
                 shutil.copyfile(ROOT / "packaging/native_tls.py", stage / "native_tls.py")
             self.assertTrue(builder.verify_candidate(executable, output, 10)["ok"])
-            with self.assertRaisesRegex(RuntimeError, "startup|exited"):
+            with self.assertRaisesRegex(RuntimeError, "Native validation failed"):
                 builder.verify_http_stage(stage, output, Path(shutil.which("node")).resolve(), ROOT,
                                           invocation="original", expected_stage_digest="a" * 64)
 
@@ -445,12 +603,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
                 self.assertEqual(builder.candidate_output(root / "dist" / "new"), (root / "dist" / "new").resolve())
                 self.assertEqual(builder.candidate_output(Path(temporary) / "new"), (Path(temporary) / "new").resolve())
 
-    def test_failed_process_preserves_bounded_stderr_for_loader_diagnostics(self):
+    def test_failed_process_never_echoes_raw_loader_stderr(self):
         with tempfile.TemporaryDirectory() as temporary:
             env = builder.isolated_environment(Path(temporary) / "home", Path(temporary) / "tmp")
-            with self.assertRaisesRegex(RuntimeError, "Library not loaded: missing.dylib"):
+            with self.assertRaisesRegex(RuntimeError, "Native validation failed") as failure:
                 builder.run_bounded([sys.executable, "-c", "import sys; sys.stderr.write('Library not loaded: missing.dylib'); sys.exit(1)"],
                                     env=env, cwd=temporary, timeout=5)
+            self.assertNotIn("missing.dylib", str(failure.exception))
 
     def test_real_child_timeout_is_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:

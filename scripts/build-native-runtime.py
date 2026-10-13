@@ -34,15 +34,25 @@ SOURCE_FILES = (
     "manifest.json", "module.json", "api.openapi.json", "package.json",
     "packaging/native_entry.py", "packaging/native_self_test.py", "packaging/native_tls.py",
     "packaging/native_inputs.py", "packaging/startup_hook.py", "packaging/monitor.spec",
-    "scripts/build-native-runtime.py", "scripts/test-staged-runtime.mjs", "scripts/hash-runtime.mjs", "scripts/startup-trace.mjs",
+    "scripts/build-native-runtime.py", "scripts/test-staged-runtime.mjs", "scripts/hash-runtime.mjs", "scripts/startup-trace.mjs", "scripts/startup-diagnostics.mjs",
 )
 
 
-def source_snapshot(output, lock, provenance, node):
+def build_options(mode="off"):
+    if mode not in ("off", "bootloader-importtime"):
+        raise ValueError("Invalid startup diagnostics mode.")
+    return {"schemaVersion": 1, "startupDiagnostics": mode}
+
+
+def source_snapshot(output, lock, provenance, node, mode="off"):
+
     """Freeze only explicit build/validation inputs, never a repository tree."""
     snapshot = Path(output) / "source-snapshot"
+    options_path = Path(output) / "build-options.json"
+    options_path.parent.mkdir(parents=True, exist_ok=True)
+    options_path.write_text(json.dumps(build_options(mode), sort_keys=True, separators=(",", ":")) + "\n")
     paths = {name: ROOT / name for name in SOURCE_FILES}
-    paths.update({"inputs/requirements.lock": Path(lock), "inputs/sdk-provenance.json": Path(provenance)})
+    paths.update({"inputs/requirements.lock": Path(lock), "inputs/sdk-provenance.json": Path(provenance), "inputs/build-options.json": options_path})
     bindings = {}
     for name, source in paths.items():
         if not source.is_file() or source.is_symlink():
@@ -62,7 +72,14 @@ def source_snapshot(output, lock, provenance, node):
 
 
 def verify_input_bindings(snapshot, bindings):
-    expected = {name for name in bindings if not name.startswith("external/")}
+    expected = set(SOURCE_FILES) | {"inputs/requirements.lock", "inputs/sdk-provenance.json", "inputs/build-options.json"}
+    if set(bindings) != expected | {"external/node-executable"}:
+        raise RuntimeError("Build input binding file set changed.")
+    options = json.loads((snapshot / "inputs/build-options.json").read_text())
+    if options != build_options(options.get("startupDiagnostics")) or type(options.get("schemaVersion")) is not int:
+        raise RuntimeError("Invalid build options schema.")
+    if Path(bindings["inputs/build-options.json"]["path"]).resolve() == (snapshot / "inputs/build-options.json").resolve():
+        raise RuntimeError("Build options require independent live and frozen inputs.")
     actual = set()
     for path in snapshot.rglob("*"):
         if path.is_symlink():
@@ -276,7 +293,7 @@ def cleanup_owned_group(process, term_timeout=5, kill_timeout=5):
             except (ProcessLookupError, PermissionError):
                 pass  # The bounded group check below remains authoritative.
             if wait_owned_group(process, timeout):
-                process.communicate(timeout=1)
+                process.wait(timeout=1)
                 return
         raise RuntimeError("Owned native process group did not exit after TERM/KILL.")
     finally:
@@ -284,47 +301,228 @@ def cleanup_owned_group(process, term_timeout=5, kill_timeout=5):
             signal.signal(signum, handler)
 
 
-def run_bounded(command, *, env, cwd, timeout, log=None):
-    stream = Path(log).open("wb") if log else subprocess.PIPE
+def run_bounded(command, *, env, cwd, timeout, log=None, stderr_chunks=None, lifecycle=None):
+    if not log:
+        return run_bounded_capture(command, env=env, cwd=cwd, timeout=timeout, stderr_chunks=stderr_chunks, lifecycle=lifecycle)
+
+    state = lifecycle if lifecycle is not None else {}
+    started = time.monotonic()
+    state.update({"deadlineMs": timeout * 1000, "failure": None, "cleanupFailure": None, "cleanup": "not_spawned"})
     try:
-        process = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream,
-                                   stderr=subprocess.STDOUT if log else subprocess.PIPE,
-                                   start_new_session=True)
-        try:
-            output, error = process.communicate(timeout=timeout)
-            if process.returncode:
-                if log:
-                    raise RuntimeError("Native build failed; inspect the isolated build log: " + str(log))
-                diagnostic = (output or b"")[-2000:] + b"\n" + (error or b"")[-4000:]
-                raise RuntimeError("Native validation failed: " + diagnostic.decode("utf-8", errors="replace"))
-            if not wait_owned_group(process, 0.25):
-                raise RuntimeError("Native command left running descendants after its leader exited.")
-            return (output or b"").decode("utf-8")
-        except BaseException as error:
-            cleanup_owned_group(process)
-            if isinstance(error, subprocess.TimeoutExpired):
-                raise RuntimeError("Native build/diagnostic process exceeded its deadline.") from None
-            raise
+        with Path(log).open("wb") as stream:
+            try:
+                process = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream,
+                                           stderr=subprocess.STDOUT, start_new_session=True)
+            except Exception:
+                state["failure"] = "spawn"
+                raise NativeValidationError("spawn") from None
+            state.update({"pid": process.pid, "processGroup": process.pid, "cleanup": "pending"})
+            try:
+                process.communicate(timeout=timeout)
+                if process.returncode:
+                    raise NativeValidationError("nonzero")
+                if not wait_owned_group(process, 0.25):
+                    raise NativeValidationError("cleanup")
+                state["cleanup"] = "group_gone"
+                return ""
+            except BaseException as error:
+                failure = NativeValidationError("timeout") if isinstance(error, subprocess.TimeoutExpired) else error
+                state["failure"] = getattr(failure, "code", "interrupted")
+                try:
+                    cleanup_owned_group(process)
+                    state["cleanup"] = "group_gone"
+                except BaseException:
+                    state["cleanup"] = "failed"
+                    state["cleanupFailure"] = "cleanup"
+                raise failure
+            finally:
+                state["exitCode"] = process.returncode
     finally:
-        if log:
-            stream.close()
+        state["elapsedMs"] = (time.monotonic() - started) * 1000
 
 
-def verify_candidate(executable, output, timeout):
+class NativeValidationError(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        messages = {"spawn": "Native validation spawn failed.", "timeout": "Native build/diagnostic process exceeded its deadline.",
+                    "nonzero": "Native validation failed (nonzero exit).", "cleanup": "Native command left running descendants or cleanup failed.",
+                    "reader": "Native diagnostic pipe reader failed.", "stdout_limit": "Native validation stdout exceeded its limit.",
+                    "json": "Native validation JSON failed.", "contract": "Native self-test contract failed.",
+                    "extraction": "Native extraction directory cleanup failed.", "parser": "Startup diagnostic parser failed.",
+                    "coverage": "Startup diagnostic coverage failed."}
+        super().__init__(messages[code])
+
+
+def run_bounded_capture(command, *, env, cwd, timeout, stderr_chunks=None, lifecycle=None):
+    # Readers retain bounded data but count every byte actually received.
+    state = lifecycle if lifecycle is not None else {}
+    started = time.monotonic()
+    state.update({"pid": None, "processGroup": None, "cleanup": "not_spawned", "exitCode": None,
+                  "deadlineMs": timeout * 1000, "elapsedMs": 0, "failure": None,
+                  "cleanupFailure": None, "readerFailures": [], "pipesDrained": False,
+                  "receivedBytes": {"stdout": 0, "stderr": 0}, "omittedBytes": {"stdout": 0, "stderr": 0}})
+    output = bytearray()
+    retained_stderr = 0
+    reader_failures = []
+    try:
+        process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+    except Exception:
+        state.update({"failure": "spawn", "elapsedMs": (time.monotonic() - started) * 1000})
+        raise NativeValidationError("spawn") from None
+    state.update({"pid": process.pid, "processGroup": process.pid, "cleanup": "pending"})
+
+    def drain(stream, name):
+        nonlocal retained_stderr
+        try:
+            while True:
+                chunk = stream.read1(8192)
+                if not chunk:
+                    break
+                state["receivedBytes"][name] += len(chunk)
+                if name == "stdout":
+                    keep = min(len(chunk), max(0, 4 * 1024 * 1024 - len(output)))
+                    output.extend(chunk[:keep])
+                else:
+                    keep = min(len(chunk), max(0, 4 * 1024 * 1024 - retained_stderr)) if stderr_chunks is not None else 0
+                    if keep:
+                        stderr_chunks.append({"ms": (time.monotonic() - started) * 1000,
+                                              "text": chunk[:keep].decode("ascii", errors="replace")})
+                        retained_stderr += keep
+                state["omittedBytes"][name] += len(chunk) - keep
+        except Exception:
+            reader_failures.append(name + "_read")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                reader_failures.append(name + "_close")
+
+    threads = [threading.Thread(target=drain, args=(process.stdout, "stdout"), daemon=True),
+               threading.Thread(target=drain, args=(process.stderr, "stderr"), daemon=True)]
+    for thread in threads:
+        thread.start()
+    failure = None
+    try:
+        process.wait(timeout=timeout)
+        if process.returncode:
+            raise NativeValidationError("nonzero")
+        if not wait_owned_group(process, 0.25):
+            raise NativeValidationError("cleanup")
+        state["cleanup"] = "group_gone"
+    except BaseException as error:
+        failure = NativeValidationError("timeout") if isinstance(error, subprocess.TimeoutExpired) else error
+        state["failure"] = getattr(failure, "code", "interrupted")
+        try:
+            cleanup_owned_group(process)
+            state["cleanup"] = "group_gone"
+        except BaseException:
+            state["cleanup"] = "failed"
+            state["cleanupFailure"] = "cleanup"
+    finally:
+        for thread in threads:
+            thread.join(timeout=2)
+        state.update({"exitCode": process.returncode, "pipesDrained": not any(thread.is_alive() for thread in threads),
+                      "readerFailures": sorted(set(reader_failures)), "elapsedMs": (time.monotonic() - started) * 1000})
+    if not failure and (reader_failures or not state["pipesDrained"]):
+        failure = NativeValidationError("reader")
+    if not failure and state["omittedBytes"]["stdout"]:
+        failure = NativeValidationError("stdout_limit")
+    if failure:
+        state["failure"] = getattr(failure, "code", "interrupted")
+        raise failure
+    try:
+        return output.decode("utf-8")
+    except UnicodeError:
+        state["failure"] = "json"
+        raise NativeValidationError("json") from None
+
+
+def parse_diagnostics(chunks, node, snapshot, mode, *, expected_parent_pid=None):
+    program = """
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const { createStartupDiagnosticsCollector, startupDiagnosticsCoverage } = await import(pathToFileURL(process.argv[1]).href);
+let ms = 0;
+const collector = createStartupDiagnosticsCollector({ nowMs: () => ms, mode: process.argv[2] });
+for (const chunk of JSON.parse(fs.readFileSync(0, 'utf8'))) { ms = chunk.ms; collector.push(chunk.text); }
+const result = collector.finish();
+result.coverage = startupDiagnosticsCoverage(result, { mode: process.argv[2], expectedParentPid: JSON.parse(process.argv[3]) });
+console.log(JSON.stringify(result));
+"""
+    result = subprocess.run([str(node), "--input-type=module", "-e", program,
+                             str(snapshot / "scripts/startup-diagnostics.mjs"), mode, json.dumps(expected_parent_pid)],
+                            input=json.dumps(chunks), capture_output=True, text=True, timeout=15,
+                            env={"PATH": ""})
+    if result.returncode:
+        raise RuntimeError("Startup diagnostic parser failed.")
+    return json.loads(result.stdout)
+
+
+def verify_candidate(executable, output, timeout, *, node=None, snapshot=None, mode="off", invocation="original"):
     with tempfile.TemporaryDirectory(prefix="native-self-test-", dir=output) as scratch:
         scratch = Path(scratch)
         env = isolated_environment(scratch / "home", scratch / "tmp")
         launched = time.monotonic()
-        text = run_bounded([str(executable), "--self-test"], env=env, cwd=scratch, timeout=timeout)
-        process_wall_ms = round((time.monotonic() - launched) * 1000)
-        result = json.loads(text)
-        if result.get("ok") is not True or result.get("frozen") is not True:
-            raise RuntimeError("The candidate did not pass an actual frozen dependency self-test.")
-        if result.get("nativeLibraries", {}).get("checked") is not True:
-            raise RuntimeError("The candidate's loaded native dependency closure was not checked.")
-        if list((scratch / "tmp").glob("_MEI*")):
-            raise RuntimeError("The onefile candidate did not clean its extraction directory.")
-        return {**result, "externalLaunchToExitMs": process_wall_ms}
+        chunks = []
+        evidence = {"invocation": invocation, "status": "failed", "deadlineMs": timeout * 1000,
+                    "lifecycle": {}, "failure": None, "parserFailure": None, "startupDiagnostics": None}
+        failure = None
+        result = None
+        process_wall_ms = None
+        try:
+            text = run_bounded([str(executable), "--self-test"], env=env, cwd=scratch, timeout=timeout,
+                               stderr_chunks=chunks, lifecycle=evidence["lifecycle"])
+            process_wall_ms = round((time.monotonic() - launched) * 1000)
+            try:
+                result = json.loads(text)
+            except (ValueError, TypeError):
+                raise NativeValidationError("json") from None
+            if (not isinstance(result, dict) or result.get("ok") is not True or result.get("frozen") is not True
+                    or not isinstance(result.get("nativeLibraries"), dict) or result["nativeLibraries"].get("checked") is not True):
+                raise NativeValidationError("contract")
+            if list((scratch / "tmp").glob("_MEI*")):
+                raise NativeValidationError("extraction")
+        except BaseException as error:
+            failure = error
+            evidence["failure"] = getattr(error, "code", "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "contract")
+        finally:
+            evidence["externalLaunchToExitMs"] = process_wall_ms if process_wall_ms is not None else round((time.monotonic() - launched) * 1000)
+            evidence["elapsedMs"] = evidence["externalLaunchToExitMs"]
+            if node and snapshot:
+                try:
+                    diagnostic = parse_diagnostics(chunks, node, snapshot, mode,
+                                                   expected_parent_pid=evidence["lifecycle"].get("pid"))
+                    diagnostic["transportReceivedBytes"] = evidence["lifecycle"].get("receivedBytes", {}).get("stderr", 0)
+                    diagnostic["transportOmittedBytes"] = evidence["lifecycle"].get("omittedBytes", {}).get("stderr", 0)
+                    if diagnostic["transportOmittedBytes"]:
+                        diagnostic["status"] = "incomplete"
+                        diagnostic["reasonCodes"].append("transport_byte_limit")
+                        diagnostic["coverage"].update({"ok": False, "status": "failed"})
+                        diagnostic["coverage"]["reasonCodes"].append("transport_truncated")
+                    evidence["startupDiagnostics"] = diagnostic
+                    if mode != "off" and (diagnostic["transportOmittedBytes"] or not diagnostic["coverage"]["ok"]):
+                        if failure is None:
+                            failure = NativeValidationError("coverage")
+                            evidence["failure"] = "coverage"
+                except Exception:
+                    evidence["parserFailure"] = "parser"
+                    if failure is None:
+                        failure = NativeValidationError("parser")
+                        evidence["failure"] = "parser"
+            elif mode != "off" and failure is None:
+                failure = NativeValidationError("parser")
+                evidence["failure"] = evidence["parserFailure"] = "parser"
+            evidence["status"] = "failed" if failure else "passed"
+            # Lifecycle and original fixed failure survive parser failure.
+            try:
+                (Path(output) / ("selftest-startup-" + invocation + ".json")).write_text(json.dumps(evidence, indent=2) + "\n")
+            except OSError:
+                if failure is None:
+                    failure = RuntimeError("Self-test structured diagnostic persistence failed.")
+        if failure:
+            raise failure
+        return {**result, **evidence}
 
 
 def verify_http_stage(stage, output, node, snapshot, *, invocation, expected_stage_digest):
@@ -342,17 +540,26 @@ process.once('SIGINT', stop); process.once('SIGTERM', stop);
 try {
   const result = await testStagedRuntime(process.argv[3], {
     startupTimeoutMs: 30000, requestTimeoutMs: 1500, stopTimeoutMs: 2000,
-    signal: abort.signal, collectStartupTrace: true,
+    signal: abort.signal, collectStartupTrace: true, startupDiagnosticsMode: pending.startupDiagnosticsMode,
   });
   if (result.startupTrace?.status !== 'complete') {
     const error = new Error('Native startup trace is not complete.');
-    error.startupTrace = result.startupTrace; throw error;
+    error.startupTrace = result.startupTrace; error.startupDiagnostics = result.startupDiagnostics; throw error;
+  }
+  if (pending.startupDiagnosticsMode !== 'off') {
+    const { startupDiagnosticsCoverage } = await import(new URL('./startup-diagnostics.mjs', pathToFileURL(process.argv[2])));
+    const coverage = startupDiagnosticsCoverage(result.startupDiagnostics, { mode: pending.startupDiagnosticsMode });
+    if (result.startupDiagnostics) result.startupDiagnostics.coverage = coverage;
+    if (!coverage.ok) {
+      const error = new Error('Native diagnostic coverage failed.');
+      error.startupTrace = result.startupTrace; error.startupDiagnostics = result.startupDiagnostics; throw error;
+    }
   }
   // Only the supervising Python validator may finalize this as passed.
   fs.writeFileSync(process.argv[4], JSON.stringify({ ...pending, status: 'collected', startupTrace: result.startupTrace, result }, null, 2));
   console.log(JSON.stringify(result));
 } catch (error) {
-  fs.writeFileSync(process.argv[4], JSON.stringify({ ...pending, status: 'failed', error: error.message, startupTrace: error.startupTrace ?? null }, null, 2));
+  fs.writeFileSync(process.argv[4], JSON.stringify({ ...pending, status: 'failed', error: error.message, startupDiagnostics: error.startupDiagnostics ?? null, startupTrace: error.startupTrace ?? null }, null, 2));
   console.error(error.message); process.exitCode = 1;
 }
 finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
@@ -365,7 +572,7 @@ finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTER
         # and failures; relocation must not overwrite original-start evidence.
         descriptor, evidence_path = tempfile.mkstemp(prefix="http-startup-", suffix=".json", dir=output)
         binding = {"invocation": invocation, "expectedRuntimeSha256": expected_stage_digest,
-                   "timeoutScope": "builder-diagnostic", "startupTimeoutMs": 30000}
+                   "timeoutScope": "builder-diagnostic", "startupTimeoutMs": 30000, "startupDiagnosticsMode": json.loads((snapshot / "inputs/build-options.json").read_text())["startupDiagnostics"] if (snapshot / "inputs/build-options.json").exists() else "off"}
         pending = {**binding, "status": "running", "startupTrace": None}
         with os.fdopen(descriptor, "w", encoding="utf-8") as evidence:
             json.dump(pending, evidence)
@@ -431,7 +638,7 @@ def build(args):
     node = absolute_input(args.node_executable)
     wheelhouse = absolute_input(args.wheelhouse, directory=True)
     output.mkdir(parents=True, mode=0o700)
-    snapshot, bindings, snapshot_digest = source_snapshot(output, lock, provenance, node)
+    snapshot, bindings, snapshot_digest = source_snapshot(output, lock, provenance, node, args.startup_diagnostics)
     frozen_lock = snapshot / "inputs/requirements.lock"
     frozen_provenance = snapshot / "inputs/sdk-provenance.json"
     versions = verify_environment(frozen_lock)
@@ -454,14 +661,14 @@ def build(args):
     if not executable.is_file() or executable.is_symlink() or not os.access(executable, os.X_OK):
         raise RuntimeError("PyInstaller did not produce the expected native executable.")
     initial_stage_digest = stage_digest(stage, output, node, snapshot)
-    self_test = verify_candidate(executable, output, args.self_test_timeout)
+    self_test = verify_candidate(executable, output, args.self_test_timeout, node=node, snapshot=snapshot, mode=args.startup_diagnostics)
     http_test = verify_http_stage(stage, output, node, snapshot, invocation="original", expected_stage_digest=initial_stage_digest)
     if http_test["runtimeSha256"] != initial_stage_digest:
         raise RuntimeError("Native stage changed during dependency validation.")
     with tempfile.TemporaryDirectory(prefix="中文 路径 ", dir=output) as relocated:
         relocated_stage = Path(relocated) / "stage"
         shutil.copytree(stage, relocated_stage)
-        relocated_test = verify_candidate(relocated_stage / "bin" / "monitor-server", output, args.self_test_timeout)
+        relocated_test = verify_candidate(relocated_stage / "bin" / "monitor-server", output, args.self_test_timeout, node=node, snapshot=snapshot, mode=args.startup_diagnostics, invocation="relocated")
         relocated_http = verify_http_stage(relocated_stage, output, node, snapshot,
                                            invocation="relocated", expected_stage_digest=initial_stage_digest)
         if relocated_http["runtimeSha256"] != http_test["runtimeSha256"]:
@@ -475,7 +682,7 @@ def build(args):
     if stage_digest(stage, output, node, snapshot) != initial_stage_digest:
         raise RuntimeError("Native stage changed before writing candidate evidence.")
     report = {
-        "schemaVersion": 1, "kind": "local-native-candidate", "target": "macos-arm64",
+        "schemaVersion": 2, "buildOptions": build_options(args.startup_diagnostics), "kind": "local-native-candidate", "target": "macos-arm64",
         "productionSigned": False, "minimumOsValidated": False, "published": False, "releaseEligible": False,
         "pythonVersion": platform.python_version(), "buildOsVersion": platform.mac_ver()[0],
         "requirementsLockSha256": bindings["inputs/requirements.lock"]["sha256"], "versions": versions,
@@ -492,6 +699,7 @@ def build(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--startup-diagnostics", choices=("off", "bootloader-importtime"), default="off")
     parser.add_argument("--output", required=True, help="New output directory; must not exist.")
     parser.add_argument("--sdk-provenance", required=True)
     parser.add_argument("--node-executable", required=True, help="Absolute Node executable for actual staged HTTP validation.")

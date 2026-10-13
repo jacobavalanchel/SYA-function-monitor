@@ -36,6 +36,7 @@ fs.writeFileSync(path.join(witness, 'process.json'), JSON.stringify(details));
 const record = value => fs.appendFileSync(path.join(witness, 'calls.jsonl'), JSON.stringify(value) + '\n');
 const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
 if (mode.startsWith('trace-')) {
+  fs.writeSync(2, '[PYI-123:DEBUG] LOADER: extracting files to temporary directory...\n[PYI-124:DEBUG] LOADER: process level = 1\nimport time: 15 | 50 | ssl\nPRIVATE_DIAGNOSTIC_SENTINEL\n');
   const stages = ${JSON.stringify(startupStages)};
   const count = ['trace-exit', 'trace-hang', 'trace-signal'].includes(mode) ? 2 : stages.length;
   for (let index = 0; index < count; index++) {
@@ -649,3 +650,23 @@ test('CLI returns failure without copying private runtime logs', async t => {
   assert.equal(status, 1); assert.match(output, /exited before/); assert(!output.includes('DO-NOT-PRINT-RUNTIME-LOG'));
   checkCleanup(witness);
 });
+
+for (const mode of ['trace-success', 'trace-exit', 'trace-hang']) {
+  test('shared diagnostic collector retains bounded evidence through ' + mode, async t => {
+    const { directory, witness } = fixture(t, mode);
+    let result;
+    try {
+      result = await testStagedRuntime(directory, { ...settings, collectStartupTrace: true, startupDiagnosticsMode: 'bootloader-importtime' });
+      assert.equal(mode, 'trace-success');
+    } catch (error) {
+      assert.notEqual(mode, 'trace-success');
+      result = error;
+    }
+    assert.equal(result.startupDiagnostics.events.length, 3);
+    assert.equal(result.startupDiagnostics.events[2].pid, 124);
+    assert.equal(result.startupDiagnostics.finished, true);
+    assert(!JSON.stringify(result).includes('PRIVATE_DIAGNOSTIC_SENTINEL'));
+    const { pid } = JSON.parse(fs.readFileSync(path.join(witness, 'process.json')));
+    assert.equal(exists(pid), false);
+  });
+}

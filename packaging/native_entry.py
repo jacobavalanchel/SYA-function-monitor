@@ -39,7 +39,7 @@ def main():
         except Exception as error:
             # No configuration or credential values are involved in this path.
             print(json.dumps({"ok": False, "errorType": type(error).__name__,
-                              "error": str(error)}), flush=True)
+                              "error": "Native self-test failed."}), flush=True)
             return 1
         print(json.dumps(result, sort_keys=True), flush=True)
         return 0

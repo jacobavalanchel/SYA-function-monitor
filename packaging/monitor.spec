@@ -18,6 +18,13 @@ for name, version in {"pyinstaller": "6.22.3", "numpy": "1.26.4", "Pillow": "11.
     if importlib.metadata.version(name) != version:
         raise RuntimeError("Unpinned build dependency: " + name)
 
+options = json.loads((ROOT / "inputs/build-options.json").read_text())
+if (set(options) != {"schemaVersion", "startupDiagnostics"} or type(options["schemaVersion"]) is not int
+        or options["schemaVersion"] != 1 or options["startupDiagnostics"] not in ("off", "bootloader-importtime")):
+    raise RuntimeError("Invalid bound native build options.")
+diagnostic = options["startupDiagnostics"] == "bootloader-importtime"
+interpreter_options = [("X importtime", None, "OPTION")] if diagnostic else []
+
 sdk = json.loads(Path(os.environ["SYA_NATIVE_SDK_PROVENANCE"]).read_text())
 datas = [(str(ROOT / name), ".") for name in ("manifest.json", "index.html", "config.example.json")]
 datas += collect_data_files("mediapipe")
@@ -105,7 +112,7 @@ a = Analysis([str(ROOT / "packaging" / "native_entry.py")],
 # selected pair after Analysis; do not remove or alter cv2's original libraries.
 a.binaries, a.datas = preserve_interpreter_openssl(a.binaries, a.datas, openssl_libraries)
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="monitor-server",
-          debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
+exe = EXE(pyz, a.scripts, a.binaries, a.datas, interpreter_options, name="monitor-server",
+          debug=diagnostic, bootloader_ignore_signals=False, strip=False, upx=False,
           console=True, disable_windowed_traceback=False, argv_emulation=False,
           target_arch="arm64", codesign_identity=None, entitlements_file=None)

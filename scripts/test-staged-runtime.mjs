@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { runtimeTreeSha256 } from './hash-runtime.mjs';
+import { createStartupDiagnosticsCollector } from './startup-diagnostics.mjs';
 import { createStartupTraceCollector } from './startup-trace.mjs';
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'];
@@ -177,7 +178,7 @@ async function stopRuntime(child, timeoutMs) {
   if (!(await wait())) throw inspectError ?? new Error('Owned runtime process group did not exit.');
 }
 
-export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, requestTimeoutMs = 1500, stopTimeoutMs = 2000, signal, collectStartupTrace = false } = {}) {
+export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, requestTimeoutMs = 1500, stopTimeoutMs = 2000, signal, collectStartupTrace = false, startupDiagnosticsMode = 'off' } = {}) {
   if (process.platform === 'win32') throw new Error('Staged runtime smoke currently requires a POSIX runner.');
   for (const value of [startupTimeoutMs, requestTimeoutMs, stopTimeoutMs]) if (!Number.isSafeInteger(value) || value < 1 || value > 30000) throw new Error('Invalid smoke timeout.');
   const runtimeDir = path.resolve(directory);
@@ -193,6 +194,7 @@ export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, r
   const signalCode = value => value === null ? null : ['SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGINT', 'SIGKILL', 'SIGPIPE', 'SIGQUIT', 'SIGSEGV', 'SIGTERM', 'SIGTRAP', 'SIGUSR1', 'SIGUSR2'].includes(value) ? value : 'OTHER';
   const exitCode = value => Number.isSafeInteger(value) ? value : null;
   const elapsed = () => spawnedAt === undefined ? 0 : Number(process.hrtime.bigint() - spawnedAt) / 1e6;
+  const diagnosticCollector = createStartupDiagnosticsCollector({ nowMs: elapsed, mode: startupDiagnosticsMode });
   const collector = collectStartupTrace ? createStartupTraceCollector({ nowMs: elapsed }) : null;
   try {
     const home = path.join(state, 'home'), records = path.join(state, 'records'), temporary = path.join(state, 'tmp');
@@ -208,7 +210,7 @@ export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, r
     hostTimings.spawnBeforeMs = 0;
     lifecycle.spawn = 'pending';
     try { child = spawn(executable, args, {
-      cwd: runtimeDir, detached: true, shell: false, stdio: collector ? ['ignore', 'ignore', 'pipe'] : 'ignore',
+      cwd: runtimeDir, detached: true, shell: false, stdio: (collector || startupDiagnosticsMode !== 'off') ? ['ignore', 'ignore', 'pipe'] : 'ignore',
       env: {
         ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
         ...(process.env.MONITOR_PYTHON ? { MONITOR_PYTHON: process.env.MONITOR_PYTHON } : {}),
@@ -221,7 +223,7 @@ export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, r
       lifecycle.outcome = 'spawn_error'; throw new Error('Runtime spawn failed.');
     }
     hostTimings.spawnReturnMs = elapsed();
-    child.stderr?.on('data', chunk => collector?.push(chunk));
+    child.stderr?.on('data', chunk => { collector?.push(chunk); diagnosticCollector.push(chunk); });
     child.once('spawn', () => { lifecycle.spawn = 'spawned'; hostTimings.spawnEventMs = elapsed(); });
     child.once('error', error => { spawnFailed = true; lifecycle.spawn = 'error'; lifecycle.spawnErrorCode = errorCode(error); hostTimings.errorMs = elapsed(); });
     child.once('exit', (code, signal) => { lifecycle.exitCode = exitCode(code); lifecycle.signalCode = signalCode(signal); hostTimings.exitMs = elapsed(); });
@@ -278,7 +280,7 @@ export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, r
   finally {
     const errors = failure ? [failure.message] : [];
     try { await stopRuntime(child, stopTimeoutMs); } catch (error) { errors.push(error.message); }
-    if (collector && closePromise) {
+    if ((collector || startupDiagnosticsMode !== 'off') && closePromise) {
       // Child exit and group disappearance do not mean stderr has drained.
       // Bound this final pipe barrier independently of TERM/KILL cleanup.
       let timer;
@@ -304,6 +306,7 @@ export async function testStagedRuntime(directory, { startupTimeoutMs = 10000, r
   }
   if (!failure) lifecycle.outcome = 'passed';
   const diagnostics = collector ? { startupTrace: { ...collector.finish(), hostTimings: { ...hostTimings }, lifecycle: { ...lifecycle } } } : {};
+  diagnostics.startupDiagnostics = diagnosticCollector.finish();
   if (failure) { Object.assign(failure, diagnostics); throw failure; }
   return { runtimeSha256: digest, authenticatedOperations: probes.length, successfulGetPaths: SAFE_GETS, sseHandshake: true, ...diagnostics };
 }

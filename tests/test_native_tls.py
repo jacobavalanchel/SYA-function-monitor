@@ -206,7 +206,7 @@ class NativeTlsBoundaryTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(entry.main(), 1)
         self.assertEqual(json.loads(output.getvalue()),
-                         {"ok": False, "errorType": "RuntimeError", "error": "CA digest mismatch"})
+                         {"ok": False, "errorType": "RuntimeError", "error": "Native self-test failed."})
 
 
 class QuietHandler(http.server.BaseHTTPRequestHandler):
