@@ -1,6 +1,33 @@
 # Monitor Function
 
-Private Git submodule for SYA local focus monitoring.
+Public Git repository for SYA local focus monitoring, integrated into SYA-UI as
+the `function/monitor` Git submodule over HTTPS:
+`https://github.com/jacobavalanchel/SYA-function-monitor.git`.
+
+Public visibility changes read access, not the implementation or Git ownership.
+`index.html` is the attention-aware video demo; it does not replace the
+Python/local-HTTP runtime, TypeScript adapter or Electron native collection.
+`package.json` keeps `private: true` to prevent accidental npm publication; this
+is independent of GitHub repository visibility.
+
+## Source build from SYA-UI
+
+Initialize the parent-pinned commit, then compile its TypeScript adapter:
+
+```bash
+git submodule update --init -- function/monitor
+npm run build:function:monitor
+```
+
+Inspect and preserve existing local submodule changes before synchronization;
+do not use `--remote` to move a reviewed gitlink during a build. Anonymous HTTPS
+read access needs no SSH key or private-repository token. Public Release assets
+can also be downloaded without a token, but final desktop runtime packaging
+still requires the release lock, archive/tree digests and runtime checks.
+
+`npm run build` within this repository only compiles the TypeScript adapter.
+Self-contained Python/native runtime packaging follows `packaging/README.md`;
+an HTML file or a successful TypeScript build is not a packaged runtime.
 
 ## Scope
 

@@ -1,8 +1,8 @@
 {
   "name": "monitor",
   "packageName": "@sya/function-monitor",
-  "visibility": "private",
-  "repository": "git@github.com:jacobavalanchel/SYA-function-monitor.git",
+  "visibility": "public",
+  "repository": "https://github.com/jacobavalanchel/SYA-function-monitor.git",
   "sourceAnchors": [
     "app/electron/monitor/screen.ts",
     "app/electron/monitor/camera.ts",
