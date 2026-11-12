@@ -39,6 +39,11 @@ index for the saved system device. Status distinguishes an opened device from on
 fresh frames. The desktop can retry after a no-frame error. Screen and
 Accessibility evidence come from authorized desktop collectors in this mode.
 The independent research web dashboard keeps its standalone workflow.
+The release archive includes the checked-in engine Python source at
+`assets/multimodal/`. The optional macOS Apple Silicon research engine requires
+a separately provisioned Python environment, the local M1 weights checked by
+the loader, and an offline MLX model cache. Those are outside the runtime
+archive.
 
 
 ## Scope

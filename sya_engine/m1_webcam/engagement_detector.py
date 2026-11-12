@@ -68,7 +68,7 @@ class EngagementDetector:
                 weights_dir = local_weights
             else:
                 weights_dir = os.path.expanduser("~/.emotiefflib")
-        
+
         self.weights_dir = weights_dir
         self.onnx_path = os.path.join(weights_dir, "enet_b0_8_best_vgaf.onnx")
         self.h5_path = os.path.join(weights_dir, "engagement_single_attention.h5")
@@ -141,7 +141,7 @@ class EngagementDetector:
         stat_func = np.std
         std_feat = stat_func(features, axis=0).reshape((1, -1)) # (1, 1280)
         mean_x = np.repeat(std_feat, self.sliding_window_width, axis=0) # (128, 1280)
-        
+
         # Concatenate std and original features -> (128, 2560)
         window_feature = np.concatenate((mean_x, features), axis=1) # (128, 2560)
         window_batch = np.expand_dims(window_feature, axis=0) # (1, 128, 2560)
@@ -248,7 +248,7 @@ class EngagementDetector:
         # Extract features for the latest sliding_window_width valid face frames
         window_faces = valid_faces[-self.sliding_window_width:]
         features = self.fer.extract_features(window_faces)
-        
+
         # Classify using cached head
         pred_label, scores_dict = self.classify_window_features(features)
 
@@ -292,7 +292,7 @@ class EngagementDetector:
                 break
             if max_frames and frame_idx >= max_frames:
                 break
-            
+
             ts = frame_idx / fps
             frame_idx += 1
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -330,7 +330,7 @@ class EngagementDetector:
             windows_features.append(np.concatenate((mean_x, w), axis=1))
 
         windows_batch = np.array(windows_features)
-        
+
         t_cls = time.time()
         scores = self.engagement_head.predict(windows_batch, verbose=0)
         cls_time = time.time() - t_cls

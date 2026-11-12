@@ -54,13 +54,13 @@ def extract_video_frames_in_range(
         ret, frame = cap.read()
         if not ret:
             break
-        
+
         session_ts = (current_frame / fps) + video_offset_sec
         if session_ts >= start_sec and session_ts <= end_sec:
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames_rgb.append(image_rgb)
             timestamps.append(session_ts)
-        
+
         current_frame += 1
 
     cap.release()
@@ -144,7 +144,7 @@ class ReplayCoordinator:
                 # --- 2. M2: Screen screenshot inference ---
                 # Strictly causal: select screenshot(s) available at or before w_end
                 causal_screenshots = [s for s in manifest.screenshots if s.timestamp <= w_end]
-                
+
                 m2_t0 = time.time()
                 if causal_screenshots:
                     # Choose the most recent screenshot before or at w_end

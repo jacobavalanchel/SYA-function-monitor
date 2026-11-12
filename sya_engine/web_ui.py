@@ -465,7 +465,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
     .badge-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
     .badge-dot.live { background: var(--success); box-shadow: 0 0 8px var(--success); }
-    
+
     /* Controls card */
     .control-card {
       background: var(--card-bg);
@@ -522,7 +522,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       align-items: center;
     }
     .card-body { padding: 12px 14px; flex: 1; display: flex; flex-direction: column; gap: 10px; }
-    
+
     .media-box {
       width: 100%; height: 180px; background: #000; border-radius: 6px;
       overflow: hidden; display: flex; align-items: center; justify-content: center;
@@ -597,7 +597,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
     <div class="status-badges">
       <div id="infer-indicator" class="badge" style="display:none;background:rgba(251,191,36,0.15);border-color:var(--warning);color:var(--warning);">
-        <div class="badge-dot" style="background:var(--warning);box-shadow:0 0 8px var(--warning);"></div> 
+        <div class="badge-dot" style="background:var(--warning);box-shadow:0 0 8px var(--warning);"></div>
         <span id="txt-infer">⏳ 正在计算实时窗口 (M1 + M2)...</span>
       </div>
       <div class="badge"><div id="dot-ws" class="badge-dot"></div> <span id="txt-ws">WebSocket: 连接中</span></div>
@@ -628,7 +628,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   <!-- 3 Module Columns -->
   <div class="modules-grid">
-    
+
     <!-- M1 Webcam Card -->
     <div class="card">
       <div class="card-header">
@@ -743,7 +743,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
 
         <hr style="border:none;border-top:1px dashed var(--card-border);margin:4px 0;">
-        
+
         <div style="font-size:0.75rem;font-weight:700;color:var(--accent);margin-bottom:4px;">严格科学边界执行状态:</div>
         <div class="kv-row">
           <span class="kv-label">P (生理注意支持):</span>
@@ -877,7 +877,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       const s = rec.screen || {};
       const m2W = document.getElementById('m2-w');
       const m2Goal = document.getElementById('m2-goal');
-      
+
       m2W.textContent = String(s.W_hat);
       m2W.className = 'pred-badge ' + (s.W_hat === true ? 'pred-engaged' : (s.W_hat === false ? 'pred-distracted' : 'pred-null'));
 

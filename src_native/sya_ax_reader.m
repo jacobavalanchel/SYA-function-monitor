@@ -36,7 +36,7 @@ static void traverseChildren(AXUIElementRef node, NSMutableArray<NSString *> *ch
         NSUInteger count = children.count;
         for (NSUInteger i = 0; i < count && *totalLen < maxLen; i++) {
             AXUIElementRef child = (__bridge AXUIElementRef)children[i];
-            
+
             CFTypeRef roleRef = NULL;
             AXUIElementCopyAttributeValue(child, kAXRoleAttribute, &roleRef);
             NSString *role = roleRef ? (__bridge NSString *)roleRef : @"";

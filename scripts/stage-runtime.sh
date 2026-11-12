@@ -44,6 +44,14 @@ git ls-files -z -- scripts patches | while IFS= read -r -d '' source_file; do
   mkdir -p "${stage_root}/$(dirname "${source_file}")"
   cp "${source_file}" "${stage_root}/${source_file}"
 done
+# The opt-in desktop research engine uses externally provisioned Python and models.
+# Only stage checked-in Python sources, never model files or recorded inputs.
+git ls-files -z -- run_engine.py sya_engine | while IFS= read -r -d '' source_file; do
+  [[ "${source_file}" == *.py ]] || continue
+  test -f "${source_file}" && test ! -L "${source_file}"
+  mkdir -p "${stage_root}/assets/multimodal/$(dirname "${source_file}")"
+  cp "${source_file}" "${stage_root}/assets/multimodal/${source_file}"
+done
 cat > "${stage_root}/bin/monitor-server" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail

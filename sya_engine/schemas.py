@@ -70,14 +70,14 @@ class ReplayWindowRecord(BaseModel):
     window: Dict[str, Any] = Field(..., description="start, end, emitted_at, latency_ms")
     screen: Dict[str, Any] = Field(..., description="M2 result summary: W_hat, goal_aligned, brief_evidence, etc.")
     person: Dict[str, Any] = Field(..., description="M1 result summary: engagement_scores, valid_frames, quality, etc.")
-    
+
     # Crucial scientific constraint fields:
     # Engagement is an estimated proxy; P (physiological attention), 4-state WxP, and work_focus are strictly null!
     state: Optional[str] = Field(None, description="WxP 4-state is NULL in zero-training minimum baseline")
     state_probs: Optional[Dict[str, float]] = Field(None, description="NULL (uncalibrated)")
     work_focus: Optional[bool] = Field(None, description="NULL (work_focus requires validated WxP, cannot be mapped directly)")
     workload: Dict[str, Any] = Field(default_factory=lambda: {"value": None, "status": "unvalidated"})
-    
+
     status: str = Field(..., description="'ok', 'partial', or 'rejected'")
     rejection_reason: Optional[str] = None
     metrics: Dict[str, Any] = Field(..., description="Latency and memory usage metrics")
