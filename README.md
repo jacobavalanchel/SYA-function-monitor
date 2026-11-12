@@ -29,6 +29,18 @@ still requires the release lock, archive/tree digests and runtime checks.
 Self-contained Python/native runtime packaging follows `packaging/README.md`;
 an HTML file or a successful TypeScript build is not a packaged runtime.
 
+### Desktop multimodal engine
+
+The local research launcher `run_engine.py` uses loopback by default. In desktop
+mode Electron starts the engine on a private port with a process-specific
+credential. The process waits for the desktop owner's camera request before
+opening the device. On macOS the desktop owner supplies the current AVFoundation
+index for the saved system device. Status distinguishes an opened device from one delivering
+fresh frames. The desktop can retry after a no-frame error. Screen and
+Accessibility evidence come from authorized desktop collectors in this mode.
+The independent research web dashboard keeps its standalone workflow.
+
+
 ## Scope
 
 - Screen monitoring.

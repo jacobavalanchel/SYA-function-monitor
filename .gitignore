@@ -20,3 +20,9 @@ release/
 build/
 node_modules/
 .DS_Store
+
+# Local research inputs, generated helper and model files
+/.venv
+/bin/sya_ax_reader
+/data/
+/sya_engine/weights/
