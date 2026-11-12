@@ -16,8 +16,8 @@ class ContractParityTests(unittest.TestCase):
         openapi = json.loads((ROOT / "api.openapi.json").read_text(encoding="utf-8"))
         source = (ROOT / "src" / "main.ts").read_text(encoding="utf-8")
         versions = {package["version"], manifest["version"], openapi["info"]["version"]}
-        self.assertEqual(versions, {"0.2.0"})
-        self.assertIn("version: '0.2.0'", source)
+        self.assertEqual(versions, {"0.2.1"})
+        self.assertIn("version: '0.2.1'", source)
 
     def test_action_sets_match(self):
         openapi = json.loads((ROOT / "api.openapi.json").read_text(encoding="utf-8"))

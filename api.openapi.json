@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "SYA Monitor Function API",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "When FUNCTION_RUNTIME_TOKEN is configured at process startup, every declared operation (including SSE) requires Authorization: Bearer <token>. Missing, invalid or unsupported tokens receive 401 before dispatch. The empty security alternative applies only to standalone startup without a configured token; it is not an authentication bypass in token mode. The real runtime also enforces its loopback Host and standalone origin policy, returning 403 on rejection. Response bodies are unchanged between modes."
   },
   "security": [{ "RuntimeBearer": [] }, {}],

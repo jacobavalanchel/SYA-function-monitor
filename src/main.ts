@@ -10,7 +10,7 @@ import type {
 
 export const manifest: FunctionManifest = {
   id: 'monitor',
-  version: '0.2.0',
+  version: '0.2.1',
   capabilities: [
     'screen-monitoring',
     'camera-monitoring',

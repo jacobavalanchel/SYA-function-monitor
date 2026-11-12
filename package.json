@@ -1,6 +1,6 @@
 {
   "name": "@sya/function-monitor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Local monitoring function module for SYA, sourced from its public HTTPS repository.",
   "type": "commonjs",
